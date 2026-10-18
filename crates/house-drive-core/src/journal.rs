@@ -8,6 +8,7 @@
 //! ```text
 //! put     <path>  <size>  <blake3>  <modified>  <base or ->
 //! delete  <path>  -       -         -           <base>
+//! restore <path>  -       -         -           -          newest trashed versions under path
 //! end     <count>
 //! ```
 
@@ -30,6 +31,11 @@ pub enum Entry {
     Delete {
         path: RelativePath,
         base: String,
+    },
+    /// Bring back from the trash the newest version of the file at `path`, or of every file under
+    /// it for a folder, where no file of that name exists now.
+    Restore {
+        path: RelativePath,
     },
 }
 
@@ -57,6 +63,7 @@ pub fn format(entries: &[Entry]) -> String {
                 base.as_deref().unwrap_or("-")
             ),
             Entry::Delete { path, base } => writeln!(text, "delete\t{path}\t-\t-\t-\t{base}"),
+            Entry::Restore { path } => writeln!(text, "restore\t{path}\t-\t-\t-\t-"),
         };
     }
     let _ = writeln!(text, "end\t{}", entries.len());
@@ -110,6 +117,7 @@ pub fn parse(text: &str) -> Result<Option<Vec<Entry>>, JournalError> {
                 }
                 Entry::Delete { path, base: base.to_string() }
             }
+            "restore" => Entry::Restore { path },
             _ => return Err(error(number, "unknown operation")),
         };
         entries.push(entry);
@@ -142,6 +150,7 @@ mod tests {
                 base: Some(h('c')),
             },
             Entry::Delete { path: RelativePath::parse("d.txt").unwrap(), base: h('d') },
+            Entry::Restore { path: RelativePath::parse("e").unwrap() },
         ];
     }
 
@@ -155,7 +164,7 @@ mod tests {
     fn a_journal_cut_short_is_incomplete() {
         let text = format(&entries());
         assert_eq!(parse(""), Ok(None));
-        let without_end = text.lines().take(3).collect::<Vec<_>>().join("\n");
+        let without_end = text.lines().take(4).collect::<Vec<_>>().join("\n");
         assert_eq!(parse(&without_end), Ok(None));
         assert_eq!(parse(&text[..text.len() - 4]), Ok(None));
     }
@@ -163,7 +172,7 @@ mod tests {
     #[test]
     fn malformed_journals_are_refused() {
         let text = format(&entries());
-        assert!(parse(&text.replace("end\t3", "end\t2")).is_err());
+        assert!(parse(&text.replace("end\t4", "end\t3")).is_err());
         assert!(parse(&text.replace("a/b.txt", "../b.txt")).is_err());
         assert!(parse(&text.replace("put\tc.txt", "move\tc.txt")).is_err());
         assert!(parse(&text.replace(&h('a'), "xyz")).is_err());

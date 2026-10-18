@@ -11,11 +11,18 @@ use rusqlite::{Connection, params};
 
 use crate::paths::{PathError, RelativePath};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Version 2 added pins.
 const PINS_SCHEMA: &str = "
 CREATE TABLE pins (
+    path TEXT PRIMARY KEY COLLATE NOCASE
+) STRICT;
+";
+
+/// Version 3 added restore requests waiting to be pushed.
+const RESTORES_SCHEMA: &str = "
+CREATE TABLE restores (
     path TEXT PRIMARY KEY COLLATE NOCASE
 ) STRICT;
 ";
@@ -118,14 +125,17 @@ impl State {
 
     fn prepare(connection: Connection) -> Result<State, StateError> {
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        match version {
-            0 => {
-                connection.execute_batch(SCHEMA)?;
-                connection.execute_batch(PINS_SCHEMA)?;
-            }
-            1 => connection.execute_batch(PINS_SCHEMA)?,
-            SCHEMA_VERSION => {}
-            _ => return Err(StateError::SchemaVersion(version)),
+        if version > SCHEMA_VERSION || version < 0 {
+            return Err(StateError::SchemaVersion(version));
+        }
+        if version < 1 {
+            connection.execute_batch(SCHEMA)?;
+        }
+        if version < 2 {
+            connection.execute_batch(PINS_SCHEMA)?;
+        }
+        if version < 3 {
+            connection.execute_batch(RESTORES_SCHEMA)?;
         }
         connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(State { connection });
@@ -149,6 +159,22 @@ impl State {
 
     pub fn remove_pin(&mut self, path: &RelativePath) -> Result<(), StateError> {
         self.connection.execute("DELETE FROM pins WHERE path = ?1", params![path.as_str()])?;
+        return Ok(());
+    }
+
+    /// Restore requests waiting to be pushed.
+    pub fn restores(&self) -> Result<Vec<RelativePath>, StateError> {
+        let mut statement = self.connection.prepare("SELECT path FROM restores ORDER BY path")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut restores = Vec::new();
+        for row in rows {
+            restores.push(RelativePath::parse(&row?)?);
+        }
+        return Ok(restores);
+    }
+
+    pub fn add_restore(&mut self, path: &RelativePath) -> Result<(), StateError> {
+        self.connection.execute("INSERT OR REPLACE INTO restores (path) VALUES (?1)", params![path.as_str()])?;
         return Ok(());
     }
 
@@ -247,6 +273,7 @@ impl State {
         &mut self,
         files: &[(RelativePath, String)],
         deletions: &[PendingDeletion],
+        restores: &[RelativePath],
     ) -> Result<(), StateError> {
         let transaction = self.connection.transaction()?;
         for (path, hash) in files {
@@ -260,6 +287,9 @@ impl State {
                 "DELETE FROM deletions WHERE path = ?1 AND base = ?2",
                 params![deletion.path.as_str(), deletion.base],
             )?;
+        }
+        for path in restores {
+            transaction.execute("DELETE FROM restores WHERE path = ?1", params![path.as_str()])?;
         }
         transaction.commit()?;
         return Ok(());

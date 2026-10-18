@@ -26,6 +26,7 @@ pub struct PushReport {
     pub pushed: Vec<RelativePath>,
     pub bytes: u64,
     pub deletions: usize,
+    pub restores: usize,
     /// Changed, busy or gone since the scan: left for a later run.
     pub skipped: Vec<RelativePath>,
     /// Not pushed for lack of room on the store, as its last snapshot reported.
@@ -85,8 +86,12 @@ pub fn push(
         .filter(|record| record.pushed_hash.as_deref() != Some(record.hash.as_str()))
         .collect();
     let mut deletions = Some(state.deletions()?);
+    let mut restores = Some(state.restores()?);
     let mut report = PushReport::default();
-    if files.is_empty() && deletions.as_ref().is_some_and(Vec::is_empty) {
+    if files.is_empty()
+        && deletions.as_ref().is_some_and(Vec::is_empty)
+        && restores.as_ref().is_some_and(Vec::is_empty)
+    {
         return Ok(report);
     }
     let incoming_dir = store.incoming_dir(machine_id);
@@ -109,6 +114,10 @@ pub fn push(
         let batch_deletions: Vec<PendingDeletion> = deletions.take().unwrap_or_default();
         for deletion in &batch_deletions {
             entries.push(Entry::Delete { path: deletion.path.clone(), base: deletion.base.clone() });
+        }
+        let batch_restores: Vec<RelativePath> = restores.take().unwrap_or_default();
+        for path in &batch_restores {
+            entries.push(Entry::Restore { path: path.clone() });
         }
         while let Some(record) = queue.peek() {
             if bytes > 0 && bytes + record.size > batch_bytes {
@@ -148,7 +157,8 @@ pub fn push(
             .write_all(journal::format(&entries).as_bytes())
             .map_err(io_error(&journal_path))?;
         journal_file.sync_all().map_err(io_error(&journal_path))?;
-        state.mark_pushed(&pushed, &batch_deletions)?;
+        state.mark_pushed(&pushed, &batch_deletions, &batch_restores)?;
+        report.restores += batch_restores.len();
 
         report.batches.push(name);
         report.bytes += bytes;

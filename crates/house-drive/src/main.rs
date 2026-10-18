@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
-use house_drive_core::catalog::{Catalog, Quota};
+use house_drive_core::catalog::{Catalog, Quota, Snapshot};
+use house_drive_core::paths::RelativePath;
+use house_drive_core::reconcile::{ByHand, Resolution};
 use house_drive_core::config::{self, Config};
 use house_drive_core::credentials::{self, Credentials};
 use house_drive_core::disk;
@@ -23,19 +25,47 @@ use house_drive_core::store::{self, Store};
 const USAGE: &str = "usage: house-drive <command>
 
 commands:
+  status             this machine's cache, pending work, conflicts and the store's space
+  sync               scan, push, merge (store machine), then verify, fetch, delete and evict
+  pin <path>         keep a file or folder on this machine, later additions too
+  unpin <path>       stop keeping it (it may then be evicted)
+  fetch <path>       bring a file or folder from the store now
+  evict <path>       free a file or folder's local copies, kept on the store
+  delete <path>      delete a file or folder everywhere (the store keeps it in its trash)
+  restore <path>     bring a file or folder back from the store's trash
+  resolve <copy> keep-original | keep-copy | keep-both <new path>
+                     settle a conflict
   join               set this machine up, once, interactively
   set-credentials    store the share's user name and password again
   networks           list the networks this machine is connected to
   config             check this machine's configuration and show it
   scan               record new, changed and deleted files in the data root (pushes nothing)
   push               scan, then push new, changed and deleted files to the store
-  sync               scan, push, merge (store machine), then verify, fetch, delete and evict
   init-store <path>  create a store in an empty folder, once, on the store machine
-  merge              on the store machine: merge pushed batches, empty the trash, write the catalog";
+  merge              on the store machine: merge pushed batches, empty the trash, write the catalog
+  empty-trash [--older-than <days>]
+                     on the store machine: empty the trash now, irreversibly
+
+<path> is inside the data folder: absolute, relative to the current folder, or to the data folder.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["status"] => status(),
+        ["pin", path] => pin(path, true),
+        ["unpin", path] => pin(path, false),
+        ["fetch", path] => fetch(path),
+        ["evict", path] => evict(path),
+        ["delete", path] => delete(path),
+        ["restore", path] => restore(path),
+        ["resolve", copy, "keep-original"] => resolve(copy, None, false),
+        ["resolve", copy, "keep-copy"] => resolve(copy, None, true),
+        ["resolve", copy, "keep-both", new_path] => resolve(copy, Some(*new_path), false),
+        ["empty-trash"] => empty_trash(None),
+        ["empty-trash", "--older-than", days] => match days.parse::<i64>() {
+            Ok(days) if days >= 0 => empty_trash(Some(days)),
+            _ => Err(format!("--older-than takes a number of days, not {days}")),
+        },
         ["join"] => join(),
         ["set-credentials"] => set_credentials(),
         ["networks"] => show_networks(),
@@ -205,6 +235,7 @@ fn run_sync(full: bool) -> Result<(), String> {
         println!("no complete catalog on the store yet");
         return Ok(());
     };
+    reconcile::save_snapshot(&cached_snapshot_path()?, &snapshot).map_err(|error| error.to_string())?;
     let limits = Limits { cache_bytes: config.cache_limit_bytes(), evict_to_percent: config.evict_to_percent };
     let report = reconcile::reconcile(
         &store,
@@ -284,6 +315,15 @@ fn merge_and_print(config: &Config, store: &Store) -> Result<(), String> {
     println!("placed     {}", report.placed.len());
     println!("replaced   {}", report.replaced.len());
     println!("deleted    {}", report.deleted.len());
+    for path in &report.restored {
+        println!("restored   {path}");
+    }
+    for path in &report.restore_skipped {
+        println!("not restored {path}: a file of that name exists");
+    }
+    for path in &report.restore_missing {
+        println!("not restored {path}: nothing in the trash");
+    }
     for (machine, batch) in &report.waiting {
         println!("waiting    {machine} {batch}");
     }
@@ -326,6 +366,239 @@ fn init_store(root: &Path) -> Result<(), String> {
     let id = Store::init(root).map_err(|error| error.to_string())?;
     println!("store created at {}", root.display());
     println!("store_id = \"{id}\"");
+    return Ok(());
+}
+
+fn open_state() -> Result<State, String> {
+    return State::open(&local_dir()?.join("state.sqlite")).map_err(|error| error.to_string());
+}
+
+/// This machine's copy of the last catalog snapshot read, for working offline.
+fn cached_snapshot_path() -> Result<PathBuf, String> {
+    return Ok(local_dir()?.join("catalog.tsv"));
+}
+
+fn cached_snapshot() -> Result<Option<Snapshot>, String> {
+    return reconcile::read_snapshot_at(&cached_snapshot_path()?).map_err(|error| error.to_string());
+}
+
+/// A path given on the command line, inside the data folder: absolute, relative to the current
+/// folder when that lies inside the data folder, or relative to the data folder itself.
+fn relative(config: &Config, text: &str) -> Result<RelativePath, String> {
+    let given = Path::new(text);
+    let absolute = if given.is_absolute() {
+        given.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(|error| error.to_string())?.join(given)
+    };
+    let inside = match absolute.strip_prefix(&config.data_root) {
+        Ok(inside) => inside.to_string_lossy().to_string(),
+        Err(_) if !given.is_absolute() => text.to_string(),
+        Err(_) => return Err(format!("{text} is not inside the data folder {}", config.data_root.display())),
+    };
+    return RelativePath::parse(&inside).map_err(|error| error.to_string());
+}
+
+fn print_by_hand(verb: &str, result: &ByHand) {
+    for path in &result.done {
+        println!("{verb:<10} {path}");
+    }
+    for (path, reason) in &result.refused {
+        println!("left alone {path}: {reason}");
+    }
+}
+
+fn pin(text: &str, pinned: bool) -> Result<(), String> {
+    let config = load_config()?;
+    let path = relative(&config, text)?;
+    let mut state = open_state()?;
+    if pinned {
+        state.add_pin(&path).map_err(|error| error.to_string())?;
+        println!("pinned {path}: missing files arrive at the next sync");
+    } else {
+        state.remove_pin(&path).map_err(|error| error.to_string())?;
+        println!("unpinned {path}");
+    }
+    return Ok(());
+}
+
+fn fetch(text: &str) -> Result<(), String> {
+    let config = load_config()?;
+    let path = relative(&config, text)?;
+    let Some(_lock) = take_lock()? else {
+        println!("another run is in progress");
+        return Ok(());
+    };
+    let Some(store) = reach_store(&config)? else {
+        return Ok(());
+    };
+    let Some(snapshot) = reconcile::read_snapshot(&store).map_err(|error| error.to_string())? else {
+        return Err("no complete catalog on the store yet".to_string());
+    };
+    let mut state = open_state()?;
+    let result = reconcile::fetch_within(&store, &snapshot, &config.data_root, &mut state, &path, SystemTime::now())
+        .map_err(|error| error.to_string())?;
+    print_by_hand("fetched", &result);
+    if result.done.is_empty() && result.refused.is_empty() {
+        println!("nothing to fetch under {path}");
+    }
+    return Ok(());
+}
+
+fn evict(text: &str) -> Result<(), String> {
+    let config = load_config()?;
+    let path = relative(&config, text)?;
+    let Some(_lock) = take_lock()? else {
+        println!("another run is in progress");
+        return Ok(());
+    };
+    let mut state = open_state()?;
+    let result = reconcile::evict_within(&config.data_root, &mut state, &path).map_err(|error| error.to_string())?;
+    print_by_hand("evicted", &result);
+    return Ok(());
+}
+
+fn delete(text: &str) -> Result<(), String> {
+    let config = load_config()?;
+    let path = relative(&config, text)?;
+    let Some(_lock) = take_lock()? else {
+        println!("another run is in progress");
+        return Ok(());
+    };
+    let mut state = open_state()?;
+    let snapshot = cached_snapshot()?;
+    let result = reconcile::delete_within(&config.data_root, &mut state, snapshot.as_ref(), &path)
+        .map_err(|error| error.to_string())?;
+    print_by_hand("deleted", &result);
+    if !result.done.is_empty() {
+        println!("the store moves them to its trash after the next sync");
+    }
+    return Ok(());
+}
+
+fn restore(text: &str) -> Result<(), String> {
+    let config = load_config()?;
+    let path = relative(&config, text)?;
+    let mut state = open_state()?;
+    state.add_restore(&path).map_err(|error| error.to_string())?;
+    println!("restore of {path} requested: the store brings it back after the next sync");
+    return Ok(());
+}
+
+fn resolve(copy: &str, new_path: Option<&str>, keep_copy: bool) -> Result<(), String> {
+    let config = load_config()?;
+    let copy = relative(&config, copy)?;
+    let resolution = match new_path {
+        Some(new_path) => Resolution::KeepBoth(relative(&config, new_path)?),
+        None if keep_copy => Resolution::KeepCopy,
+        None => Resolution::KeepOriginal,
+    };
+    let Some(_lock) = take_lock()? else {
+        println!("another run is in progress");
+        return Ok(());
+    };
+    let Some(snapshot) = cached_snapshot()? else {
+        return Err("no catalog read yet: sync first".to_string());
+    };
+    let mut state = open_state()?;
+    reconcile::resolve(&config.data_root, &mut state, &snapshot, &copy, &resolution)
+        .map_err(|error| error.to_string())?;
+    println!("resolved {copy}: the next sync carries it to the store");
+    return Ok(());
+}
+
+fn empty_trash(older_than: Option<i64>) -> Result<(), String> {
+    let config = load_config()?;
+    if !config.is_store {
+        return Err("empty-trash runs on the store machine only".to_string());
+    }
+    let question = match older_than {
+        Some(days) => format!("permanently delete trashed files older than {days} days"),
+        None => "permanently delete everything in the trash".to_string(),
+    };
+    if !console::ask_yes_no(&question)? {
+        return Ok(());
+    }
+    let Some(_lock) = take_lock()? else {
+        println!("another run is in progress");
+        return Ok(());
+    };
+    let store = Store::open(&config.store_root, &config.store_id).map_err(|error| error.to_string())?;
+    let (emptied, _) = merge::empty_trash_older_than(&store, SystemTime::now(), older_than.unwrap_or(-1))
+        .map_err(|error| error.to_string())?;
+    for date in &emptied {
+        println!("emptied    trash {date}");
+    }
+    // Refreshes the store's usage in the catalog.
+    return merge_and_print(&config, &store);
+}
+
+fn status() -> Result<(), String> {
+    let config = load_config()?;
+    println!("machine    {}{}", config.machine_id, if config.is_store { " (store machine)" } else { "" });
+    if !config.is_store {
+        let home = network::on_home_network(&network::connected_networks()?, &config.home_network_id);
+        println!("network    {}", if home { "home" } else { "away from home: syncs wait" });
+    }
+    let state = open_state()?;
+    let files = state.files().map_err(|error| error.to_string())?;
+    let local_bytes: u64 = files.iter().map(|record| record.size).sum();
+    let pending: Vec<_> = files.iter().filter(|record| record.pushed_hash.as_deref() != Some(record.hash.as_str())).collect();
+    let unverified = files.iter().filter(|record| !record.verified).count();
+    let deletions = state.deletions().map_err(|error| error.to_string())?;
+    let restores = state.restores().map_err(|error| error.to_string())?;
+    let gb = |bytes: u64| {
+        return bytes as f64 / 1e9;
+    };
+    println!(
+        "cache      {} files, {:.1} of {} GB",
+        files.len(),
+        gb(local_bytes),
+        config.cache_limit_gb
+    );
+    println!(
+        "to push    {} files ({:.1} GB), {} deletions, {} restores",
+        pending.len(),
+        gb(pending.iter().map(|record| record.size).sum()),
+        deletions.len(),
+        restores.len()
+    );
+    println!("unverified {unverified} (never evicted until the store holds them)");
+    for pin in state.pins().map_err(|error| error.to_string())? {
+        println!("pinned     {pin}");
+    }
+    if local_bytes > config.cache_limit_bytes() {
+        println!("WARNING    the cache is over its limit");
+    }
+
+    let snapshot_path = cached_snapshot_path()?;
+    let Some(snapshot) = cached_snapshot()? else {
+        println!("catalog    none read yet: sync on the home network");
+        return Ok(());
+    };
+    if let Ok(modified) = std::fs::metadata(&snapshot_path).and_then(|metadata| metadata.modified())
+        && let Ok(age) = SystemTime::now().duration_since(modified)
+    {
+        println!("catalog    read {} minutes ago", age.as_secs() / 60);
+    }
+    let local: std::collections::HashSet<String> =
+        files.iter().map(|record| house_drive_core::state::key(&record.path)).collect();
+    let store_only: Vec<_> =
+        snapshot.files.iter().filter(|file| !local.contains(&house_drive_core::state::key(&file.path))).collect();
+    println!(
+        "store only {} files ({:.1} GB)",
+        store_only.len(),
+        gb(store_only.iter().map(|file| file.size).sum())
+    );
+    if let Some(quota) = &snapshot.quota {
+        print_quota(quota);
+    }
+    for conflict in &snapshot.conflicts {
+        println!("conflict   {} (from {}, copy of {})", conflict.copy, conflict.machine, conflict.original);
+    }
+    for refused in snapshot.refused.iter().filter(|refused| refused.machine == config.machine_id) {
+        println!("refused    deletion of {}: changed elsewhere since", refused.path);
+    }
     return Ok(());
 }
 

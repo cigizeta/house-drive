@@ -41,6 +41,11 @@ pub struct MergeReport {
     /// Not placed for lack of room (quota or free-space margin): pushed again later.
     pub over_quota: Vec<(String, RelativePath)>,
     pub quota: Option<Quota>,
+    pub restored: Vec<RelativePath>,
+    /// Restore requests with no trashed version to bring back.
+    pub restore_missing: Vec<RelativePath>,
+    /// Trashed versions not restored because a file of that name exists now.
+    pub restore_skipped: Vec<RelativePath>,
     pub trash_emptied: Vec<String>,
     /// Folders on the store House Drive does not recognise, left alone.
     pub ignored: Vec<PathBuf>,
@@ -332,6 +337,9 @@ fn merge_batch(
                     }
                 }
             }
+            Entry::Restore { path } => {
+                restore(store, &transaction, machine, path, report)?;
+            }
             Entry::Delete { path, base } => {
                 transaction.clear_reports(machine, path)?;
                 match transaction.get(path)? {
@@ -460,29 +468,132 @@ fn placed_conflict_copy(
     return Ok(None);
 }
 
-/// Removes trash folders older than `trash_days`. Only folders named as dates are touched.
+/// Every trashed file, newest version per path: `trash/<date>/<batch>/<path>`, ordered by date
+/// then batch.
+fn newest_trashed(store: &Store) -> Result<BTreeMap<String, (RelativePath, PathBuf)>, MergeError> {
+    let trash_dir = store.trash_dir();
+    let mut versions: BTreeMap<String, ((i64, String), RelativePath, PathBuf)> = BTreeMap::new();
+    for date_entry in fs::read_dir(&trash_dir).map_err(io_error(&trash_dir))? {
+        let date_entry = date_entry.map_err(io_error(&trash_dir))?;
+        let Some(day) = dates::parse_date(&date_entry.file_name().to_string_lossy()) else {
+            continue;
+        };
+        let date_dir = date_entry.path();
+        if !date_dir.is_dir() {
+            continue;
+        }
+        for batch_entry in fs::read_dir(&date_dir).map_err(io_error(&date_dir))? {
+            let batch_entry = batch_entry.map_err(io_error(&date_dir))?;
+            let batch = batch_entry.file_name().to_string_lossy().to_string();
+            let batch_dir = batch_entry.path();
+            let mut folders = vec![(batch_dir.clone(), String::new())];
+            while let Some((folder, prefix)) = folders.pop() {
+                let Ok(entries) = fs::read_dir(&folder) else {
+                    continue;
+                };
+                for entry in entries {
+                    let entry = entry.map_err(io_error(&folder))?;
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let text = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+                    if entry.path().is_dir() {
+                        folders.push((entry.path(), text));
+                        continue;
+                    }
+                    let Ok(path) = RelativePath::parse(&text) else {
+                        continue;
+                    };
+                    let order = (day, batch.clone());
+                    let key = crate::state::key(&path);
+                    let newer = versions.get(&key).is_none_or(|(existing, _, _)| order > *existing);
+                    if newer {
+                        versions.insert(key, (order, path, entry.path()));
+                    }
+                }
+            }
+        }
+    }
+    return Ok(versions.into_iter().map(|(key, (_, path, file))| (key, (path, file))).collect());
+}
+
+/// Brings back the newest trashed version of `requested`, or of every file under it, where no
+/// file of that name exists now. A rename on the store's own disk: the quota is unchanged, the
+/// trash counting toward it as well.
+fn restore(
+    store: &Store,
+    transaction: &CatalogTransaction,
+    machine: &str,
+    requested: &RelativePath,
+    report: &mut MergeReport,
+) -> Result<(), MergeError> {
+    let files_dir = store.files_dir();
+    let mut found = false;
+    for (_, (path, trashed)) in newest_trashed(store)? {
+        if !path.is_within(requested) {
+            continue;
+        }
+        found = true;
+        if transaction.get(&path)?.is_some() {
+            report.restore_skipped.push(path);
+            continue;
+        }
+        let Some(hash) = hash_of(&trashed)? else {
+            continue;
+        };
+        let metadata = fs::metadata(&trashed).map_err(io_error(&trashed))?;
+        let modified = metadata.modified().map(hash::nanos).unwrap_or(0);
+        place(&trashed, &path.under(&files_dir))?;
+        transaction.put_file(&CatalogFile {
+            path: path.clone(),
+            size: metadata.len(),
+            hash,
+            modified,
+            machine: machine.to_string(),
+        })?;
+        report.restored.push(path);
+    }
+    if !found {
+        report.restore_missing.push(requested.clone());
+    }
+    return Ok(());
+}
+
 fn empty_trash(
     store: &Store,
     now: SystemTime,
     trash_days: u32,
     report: &mut MergeReport,
 ) -> Result<(), MergeError> {
+    let (emptied, ignored) = empty_trash_older_than(store, now, trash_days as i64)?;
+    report.trash_emptied.extend(emptied);
+    report.ignored.extend(ignored);
+    return Ok(());
+}
+
+/// Removes trash folders more than `days` days old (`-1`: all of them, today's too), returning
+/// the dates removed and the folders ignored. Only folders named as dates are touched.
+pub fn empty_trash_older_than(
+    store: &Store,
+    now: SystemTime,
+    days: i64,
+) -> Result<(Vec<String>, Vec<PathBuf>), MergeError> {
     let trash_dir = store.trash_dir();
     let today = dates::day_of(hash::nanos(now));
+    let mut emptied = Vec::new();
+    let mut ignored = Vec::new();
     for entry in fs::read_dir(&trash_dir).map_err(io_error(&trash_dir))? {
         let entry = entry.map_err(io_error(&trash_dir))?;
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(day) = dates::parse_date(&name) else {
-            report.ignored.push(entry.path());
+            ignored.push(entry.path());
             continue;
         };
-        if today - day > trash_days as i64 {
+        if today - day > days {
             let path = entry.path();
             fs::remove_dir_all(&path).map_err(io_error(&path))?;
-            report.trash_emptied.push(name);
+            emptied.push(name);
         }
     }
-    return Ok(());
+    return Ok((emptied, ignored));
 }
 
 /// Writes the snapshot under a staging name, then renames it over the old one, so a reader sees
@@ -782,6 +893,48 @@ mod tests {
         assert_eq!(report.over_quota, vec![(A.to_string(), path("b.txt"))]);
         let quota = report.quota.unwrap();
         assert_eq!((quota.free, quota.margin, quota.room()), (50, 100, 0));
+    }
+
+    #[test]
+    fn restore_brings_back_the_newest_trashed_version() {
+        let mut setup = setup("merge-restore");
+        push_batch(&mut setup, A, &[put("d/a.txt", b"v1", None), put("d/b.txt", b"b", None)], &[], true);
+        run(&mut setup);
+        push_batch(&mut setup, A, &[put("d/a.txt", b"v2", Some(b"v1"))], &[], true);
+        run(&mut setup);
+        let deletes = [
+            Entry::Delete { path: path("d/a.txt"), base: h(b"v2") },
+            Entry::Delete { path: path("d/b.txt"), base: h(b"b") },
+        ];
+        push_batch(&mut setup, A, &[], &deletes, true);
+        run(&mut setup);
+        assert_eq!(stored(&setup, "d/a.txt"), None);
+
+        push_batch(&mut setup, B, &[], &[Entry::Restore { path: path("d") }], true);
+        let report = run(&mut setup);
+        let mut restored = report.restored.clone();
+        restored.sort();
+        assert_eq!(restored, vec![path("d/a.txt"), path("d/b.txt")]);
+        assert_eq!(stored(&setup, "d/a.txt"), Some(b"v2".to_vec()));
+        assert_eq!(setup.catalog.get(&path("d/a.txt")).unwrap().unwrap().hash, h(b"v2"));
+
+        // Again: the v1 version is still in the trash, but d/a.txt exists now.
+        push_batch(&mut setup, B, &[], &[Entry::Restore { path: path("d/a.txt") }], true);
+        let report = run(&mut setup);
+        assert_eq!(report.restore_skipped, vec![path("d/a.txt")]);
+        assert_eq!(stored(&setup, "d/a.txt"), Some(b"v2".to_vec()));
+
+        push_batch(&mut setup, B, &[], &[Entry::Restore { path: path("never") }], true);
+        assert_eq!(run(&mut setup).restore_missing, vec![path("never")]);
+    }
+
+    #[test]
+    fn emptying_the_whole_trash_includes_today() {
+        let setup = setup("merge-empty-all");
+        let today = dates::date_of(hash::nanos(now()));
+        fs::create_dir_all(setup.store.trash_dir().join(&today)).unwrap();
+        let (emptied, _) = empty_trash_older_than(&setup.store, now(), -1).unwrap();
+        assert_eq!(emptied, vec![today]);
     }
 
     #[test]

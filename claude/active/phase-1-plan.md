@@ -143,6 +143,21 @@ last fetch or modification. Coarse, and enough to evict what has not been touche
   is refused with a pointer to Windows Terminal.
 - **`networks`** lists connected networks (profile, ID, name), to check the gate by hand.
 
+**Decided while writing step 7 (2026-10-18):**
+
+- **A local copy of the last snapshot** (`%LOCALAPPDATA%\house-drive\catalog.tsv`), saved at each
+  sync, lets `status`, `delete` and `resolve` work offline and at once; their effects travel with
+  the next sync.
+- **`restore`** is a journal operation (`restore <path>`), queued in the state (schema version 3):
+  the store machine moves the newest trashed version of each file at or under the path back into
+  `files/`, unless a file of that name exists there now; reported as restored, skipped or missing.
+- **`resolve <copy>`** uses ordinary operations: `keep-original` deletes the copy; `keep-copy`
+  writes the copy over the original (recording the store's version as its base when the original
+  is not local, so its push replaces rather than conflicts) and deletes the copy; `keep-both <new
+  path>` renames the copy. The last two need the copy local.
+- **`delete`** of files only on the store queues their deletions from the local snapshot.
+- **`empty-trash`** asks for confirmation, then refreshes the catalog's usage.
+
 ## `sync`, on the store machine as well
 
 Before step 5, as the store's sole writer:

@@ -57,6 +57,8 @@ pub enum ReconcileError {
     Io { path: PathBuf, source: io::Error },
     State(StateError),
     Snapshot(String),
+    /// A request that cannot be carried out as asked, with the reason.
+    Refused(String),
 }
 
 impl fmt::Display for ReconcileError {
@@ -65,6 +67,7 @@ impl fmt::Display for ReconcileError {
             ReconcileError::Io { path, source } => write!(f, "{}: {}", path.display(), source),
             ReconcileError::State(error) => write!(f, "{error}"),
             ReconcileError::Snapshot(message) => write!(f, "{message}"),
+            ReconcileError::Refused(message) => write!(f, "{message}"),
         };
     }
 }
@@ -79,13 +82,30 @@ impl From<StateError> for ReconcileError {
 
 /// The store's current snapshot; `None` when there is none yet or it is cut short.
 pub fn read_snapshot(store: &Store) -> Result<Option<Snapshot>, ReconcileError> {
-    let path = store.root().join(CATALOG_SNAPSHOT);
+    return read_snapshot_at(&store.root().join(CATALOG_SNAPSHOT));
+}
+
+/// A snapshot from a file: the store's, or this machine's copy of the last one read, which lets
+/// `status`, `delete` and `resolve` work offline.
+pub fn read_snapshot_at(path: &Path) -> Result<Option<Snapshot>, ReconcileError> {
+    let path = path.to_path_buf();
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(ReconcileError::Io { path, source: error }),
     };
     return catalog::parse_snapshot(&text).map_err(ReconcileError::Snapshot);
+}
+
+/// Keeps a copy of a snapshot on this machine, written whole then renamed into place.
+pub fn save_snapshot(path: &Path, snapshot: &Snapshot) -> Result<(), ReconcileError> {
+    let staging = path.with_extension("tsv.new");
+    let io_error = |source| {
+        return ReconcileError::Io { path: path.to_path_buf(), source };
+    };
+    fs::write(&staging, catalog::format_snapshot(snapshot)).map_err(io_error)?;
+    fs::rename(&staging, path).map_err(io_error)?;
+    return Ok(());
 }
 
 pub struct Limits {
@@ -266,6 +286,204 @@ pub fn reconcile(
         .map(|refused| refused.path.clone())
         .collect();
     return Ok(report);
+}
+
+/// What a `fetch` or `evict` by hand did.
+#[derive(Debug, Default)]
+pub struct ByHand {
+    pub done: Vec<RelativePath>,
+    pub refused: Vec<(RelativePath, String)>,
+}
+
+/// Fetches now every file of the snapshot at or under `folder` missing here (or an unedited copy
+/// of an older version), except deletions still pending.
+pub fn fetch_within(
+    store: &Store,
+    snapshot: &Snapshot,
+    data_root: &Path,
+    state: &mut State,
+    folder: &RelativePath,
+    now: SystemTime,
+) -> Result<ByHand, ReconcileError> {
+    let fetch_dir = data_root.join(FETCH_DIR);
+    let pending: HashSet<String> = state.deletions()?.iter().map(|deletion| state::key(&deletion.path)).collect();
+    let records: HashMap<String, FileRecord> =
+        state.files()?.into_iter().map(|record| (state::key(&record.path), record)).collect();
+    let mut result = ByHand::default();
+    let mut changes = Vec::new();
+    for file in snapshot.files.iter().filter(|file| file.path.is_within(folder)) {
+        let key = state::key(&file.path);
+        if pending.contains(&key) {
+            result.refused.push((file.path.clone(), "deleted here, deletion not yet pushed".to_string()));
+            continue;
+        }
+        let existing = records.get(&key);
+        if let Some(record) = existing {
+            if record.hash == file.hash {
+                continue;
+            }
+            if record.store_hash.as_deref() != Some(record.hash.as_str()) {
+                result.refused.push((file.path.clone(), "edited here, kept".to_string()));
+                continue;
+            }
+        }
+        match fetch(store, data_root, &fetch_dir, file, existing, now) {
+            Ok(record) => {
+                changes.push(Change::Upsert(record));
+                result.done.push(file.path.clone());
+            }
+            Err(reason) => result.refused.push((file.path.clone(), reason)),
+        }
+    }
+    state.apply(&changes)?;
+    return Ok(result);
+}
+
+/// Evicts now every local file at or under `folder` the store holds verified, unedited and
+/// unchanged since the scan; pinned ones are refused (unpin first).
+pub fn evict_within(data_root: &Path, state: &mut State, folder: &RelativePath) -> Result<ByHand, ReconcileError> {
+    let pins = state.pins()?;
+    let mut result = ByHand::default();
+    let mut changes = Vec::new();
+    for record in state.files()?.into_iter().filter(|record| record.path.is_within(folder)) {
+        if pins.iter().any(|pin| record.path.is_within(pin)) {
+            result.refused.push((record.path, "pinned: unpin it first".to_string()));
+            continue;
+        }
+        if !record.verified || record.store_hash.as_deref() != Some(record.hash.as_str()) {
+            result.refused.push((record.path, "not verified on the store yet: sync first".to_string()));
+            continue;
+        }
+        let target = record.path.under(data_root);
+        match remove_if_unchanged(&target, &record) {
+            Ok(()) => {
+                remove_empty_parents(&target, data_root);
+                changes.push(Change::Deleted { path: record.path.clone(), base: None });
+                result.done.push(record.path);
+            }
+            Err(reason) => result.refused.push((record.path, reason)),
+        }
+    }
+    state.apply(&changes)?;
+    return Ok(result);
+}
+
+/// Deletes `folder` (a file or a folder) everywhere: local copies now, and the deletions queued
+/// for the next push; files only on the store (from the last snapshot read) get their deletion
+/// queued too. On the store, deleted files go to the trash.
+pub fn delete_within(
+    data_root: &Path,
+    state: &mut State,
+    snapshot: Option<&Snapshot>,
+    folder: &RelativePath,
+) -> Result<ByHand, ReconcileError> {
+    let mut result = ByHand::default();
+    let mut changes = Vec::new();
+    let mut local = HashSet::new();
+    for record in state.files()?.into_iter().filter(|record| record.path.is_within(folder)) {
+        local.insert(state::key(&record.path));
+        let target = record.path.under(data_root);
+        match fs::remove_file(&target) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                result.refused.push((record.path, error.to_string()));
+                continue;
+            }
+            _ => {}
+        }
+        remove_empty_parents(&target, data_root);
+        let base = record.pushed_hash.clone().or_else(|| record.store_hash.clone());
+        changes.push(Change::Deleted { path: record.path.clone(), base });
+        result.done.push(record.path);
+    }
+    if let Some(snapshot) = snapshot {
+        for file in snapshot.files.iter().filter(|file| file.path.is_within(folder)) {
+            if !local.contains(&state::key(&file.path)) {
+                changes.push(Change::Deleted { path: file.path.clone(), base: Some(file.hash.clone()) });
+                result.done.push(file.path.clone());
+            }
+        }
+    }
+    state.apply(&changes)?;
+    return Ok(result);
+}
+
+pub enum Resolution {
+    /// Delete the conflict copy.
+    KeepOriginal,
+    /// The copy's content replaces the original; the copy is deleted.
+    KeepCopy,
+    /// The copy is renamed and kept as a file of its own.
+    KeepBoth(RelativePath),
+}
+
+/// Settles a conflict with ordinary operations, which the next sync pushes: deleting the copy,
+/// replacing the original with it, or renaming it. Replacing and renaming need the copy here.
+pub fn resolve(
+    data_root: &Path,
+    state: &mut State,
+    snapshot: &Snapshot,
+    copy: &RelativePath,
+    resolution: &Resolution,
+) -> Result<(), ReconcileError> {
+    let refuse = |message: String| {
+        return Err(ReconcileError::Refused(message));
+    };
+    let Some(conflict) = snapshot.conflicts.iter().find(|conflict| state::key(&conflict.copy) == state::key(copy)) else {
+        return refuse(format!("{copy} is not a conflict copy in the last catalog read"));
+    };
+    if let Resolution::KeepOriginal = resolution {
+        delete_within(data_root, state, Some(snapshot), &conflict.copy)?;
+        return Ok(());
+    }
+    let records: HashMap<String, FileRecord> =
+        state.files()?.into_iter().map(|record| (state::key(&record.path), record)).collect();
+    let copy_target = conflict.copy.under(data_root);
+    if !records.contains_key(&state::key(&conflict.copy)) || !copy_target.exists() {
+        return refuse(format!("{} is not on this machine: fetch it first", conflict.copy));
+    }
+    let io_error = |path: &Path| {
+        let path = path.to_path_buf();
+        return move |source: io::Error| ReconcileError::Io { path, source };
+    };
+    match resolution {
+        Resolution::KeepOriginal => {}
+        Resolution::KeepCopy => {
+            let original_target = conflict.original.under(data_root);
+            if let Some(parent) = original_target.parent() {
+                fs::create_dir_all(parent).map_err(io_error(parent))?;
+            }
+            fs::copy(&copy_target, &original_target).map_err(io_error(&original_target))?;
+            // Not here before: record the store's version as its base, with a stamp that makes
+            // the next scan hash it, so its push replaces that version instead of conflicting.
+            if !records.contains_key(&state::key(&conflict.original))
+                && let Some(current) = snapshot.files.iter().find(|file| file.path == conflict.original)
+            {
+                state.apply(&[Change::Upsert(FileRecord {
+                    path: conflict.original.clone(),
+                    size: 0,
+                    modified: 0,
+                    hash: current.hash.clone(),
+                    store_hash: Some(current.hash.clone()),
+                    pushed_hash: Some(current.hash.clone()),
+                    verified: false,
+                    last_use: 0,
+                })])?;
+            }
+            delete_within(data_root, state, Some(snapshot), &conflict.copy)?;
+        }
+        Resolution::KeepBoth(new_path) => {
+            let new_target = new_path.under(data_root);
+            if new_target.exists() || snapshot.files.iter().any(|file| state::key(&file.path) == state::key(new_path)) {
+                return refuse(format!("{new_path} already exists"));
+            }
+            if let Some(parent) = new_target.parent() {
+                fs::create_dir_all(parent).map_err(io_error(parent))?;
+            }
+            // The next scan sees the copy gone (its deletion pushed) and a new file.
+            fs::rename(&copy_target, &new_target).map_err(io_error(&new_target))?;
+        }
+    }
+    return Ok(());
 }
 
 /// Deletes a local file only if it is still as last scanned.
@@ -563,6 +781,100 @@ mod tests {
         let report = run(&mut setup, 5);
         assert!(report.evicted.is_empty());
         assert_eq!(report.over_limit, Some(10));
+    }
+
+    #[test]
+    fn fetch_by_hand_takes_a_folder() {
+        let mut setup = setup("rec-fetch-hand");
+        on_store(&mut setup, "docs/a.txt", b"a");
+        on_store(&mut setup, "docs/sub/b.txt", b"b");
+        on_store(&mut setup, "other.txt", b"o");
+        local(&mut setup, "docs/edited.txt", b"mine", Some(b"v1"), 0);
+        on_store(&mut setup, "docs/edited.txt", b"v2");
+        let snapshot = setup.snapshot.clone();
+        let result = fetch_within(&setup.store, &snapshot, &setup.data.0, &mut setup.state, &path("docs"), SystemTime::now())
+            .unwrap();
+        let mut done = result.done.clone();
+        done.sort();
+        assert_eq!(done, vec![path("docs/a.txt"), path("docs/sub/b.txt")]);
+        assert_eq!(result.refused.len(), 1);
+        assert!(!setup.data.0.join("other.txt").exists());
+        assert!(record(&setup, "docs/sub/b.txt").unwrap().verified);
+    }
+
+    #[test]
+    fn evict_by_hand_refuses_pinned_and_unverified_files() {
+        let mut setup = setup("rec-evict-hand");
+        local(&mut setup, "docs/a.txt", b"a", Some(b"a"), 0);
+        local(&mut setup, "docs/new.txt", b"n", None, 0);
+        local(&mut setup, "docs/keep/k.txt", b"k", Some(b"k"), 0);
+        setup.state.add_pin(&path("docs/keep")).unwrap();
+        let result = evict_within(&setup.data.0, &mut setup.state, &path("docs")).unwrap();
+        assert_eq!(result.done, vec![path("docs/a.txt")]);
+        assert_eq!(result.refused.len(), 2);
+        assert!(!setup.data.0.join("docs").join("a.txt").exists());
+        assert!(setup.data.0.join("docs").join("new.txt").exists());
+        assert!(setup.state.deletions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_reaches_local_and_store_only_files() {
+        let mut setup = setup("rec-delete");
+        local(&mut setup, "docs/a.txt", b"a", Some(b"a"), 0);
+        local(&mut setup, "docs/new.txt", b"n", None, 0);
+        on_store(&mut setup, "docs/a.txt", b"a");
+        on_store(&mut setup, "docs/remote.txt", b"r");
+        let snapshot = setup.snapshot.clone();
+        let result = delete_within(&setup.data.0, &mut setup.state, Some(&snapshot), &path("docs")).unwrap();
+        assert_eq!(result.done.len(), 3);
+        assert!(!setup.data.0.join("docs").exists());
+        let mut deletions: Vec<String> =
+            setup.state.deletions().unwrap().into_iter().map(|deletion| deletion.path.to_string()).collect();
+        deletions.sort();
+        // The never-pushed file has nothing to tell the store.
+        assert_eq!(deletions, vec!["docs/a.txt", "docs/remote.txt"]);
+    }
+
+    fn with_conflict(name: &str) -> Setup {
+        let mut setup = setup(name);
+        on_store(&mut setup, "r.txt", b"mine");
+        on_store(&mut setup, "r (conflict machine-b 2026-10-18).txt", b"theirs");
+        local(&mut setup, "r (conflict machine-b 2026-10-18).txt", b"theirs", Some(b"theirs"), 0);
+        setup.snapshot.conflicts.push(crate::catalog::Conflict {
+            copy: path("r (conflict machine-b 2026-10-18).txt"),
+            original: path("r.txt"),
+            machine: "machine-b".into(),
+        });
+        return setup;
+    }
+
+    #[test]
+    fn keep_copy_replaces_the_original_against_the_stores_version() {
+        let mut setup = with_conflict("rec-keep-copy");
+        let snapshot = setup.snapshot.clone();
+        let copy = path("r (conflict machine-b 2026-10-18).txt");
+        resolve(&setup.data.0, &mut setup.state, &snapshot, &copy, &Resolution::KeepCopy).unwrap();
+        assert_eq!(fs::read(setup.data.0.join("r.txt")).unwrap(), b"theirs");
+        assert!(!copy.under(&setup.data.0).exists());
+        assert_eq!(record(&setup, "r.txt").unwrap().store_hash, Some(h(b"mine")));
+
+        // The next scan hashes the original and finds it changed, pushed against "mine".
+        let later = SystemTime::now() + Duration::from_secs(3600);
+        crate::scan::scan(&setup.data.0, &mut setup.state, later, Duration::from_secs(60)).unwrap();
+        let original = record(&setup, "r.txt").unwrap();
+        assert_eq!(original.hash, h(b"theirs"));
+        assert_eq!(original.store_hash, Some(h(b"mine")));
+    }
+
+    #[test]
+    fn keep_both_renames_the_copy() {
+        let mut setup = with_conflict("rec-keep-both");
+        let snapshot = setup.snapshot.clone();
+        let copy = path("r (conflict machine-b 2026-10-18).txt");
+        resolve(&setup.data.0, &mut setup.state, &snapshot, &copy, &Resolution::KeepBoth(path("r.txt"))).unwrap_err();
+        resolve(&setup.data.0, &mut setup.state, &snapshot, &copy, &Resolution::KeepBoth(path("r-theirs.txt"))).unwrap();
+        assert_eq!(fs::read(setup.data.0.join("r-theirs.txt")).unwrap(), b"theirs");
+        assert!(!copy.under(&setup.data.0).exists());
     }
 
     #[test]
