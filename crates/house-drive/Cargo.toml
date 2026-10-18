@@ -1,0 +1,9 @@
+[package]
+name = "house-drive"
+description = "A Google Drive lite for the machines of one home"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+house-drive-core.workspace = true

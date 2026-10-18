@@ -1,0 +1,27 @@
+# House Drive's configuration, one file per machine, at %LOCALAPPDATA%\house-drive\config.toml.
+# Every value below is a placeholder: the real file is written by `house-drive join` and never
+# committed.
+
+# Unique per machine: lowercase letters, digits and hyphens. Also the name of its journal folder.
+machine_id = "machine-a"
+
+# The tree this machine caches.
+data_root = 'C:\example\data'
+
+# The store's share; on the store machine, its local path.
+store_root = '\\store-machine\house-drive'
+
+# Written by `house-drive init-store`, checked at every run.
+store_id = "00000000-0000-0000-0000-000000000000"
+
+# Windows' ID of the home network, recorded by `house-drive join`.
+home_network_id = "{00000000-0000-0000-0000-000000000000}"
+
+# True on the store machine only.
+is_store = false
+
+# The rest are optional, shown with their defaults.
+sync_minutes = 10
+cache_limit_gb = 256
+evict_to_percent = 90
+trash_days = 30

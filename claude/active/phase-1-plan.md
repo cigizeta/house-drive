@@ -50,9 +50,12 @@ A pushing machine only ever **creates** files, in its own `incoming/` and `journ
 permissions require (design.md, security point 5). Everything else, moving files into `files/`,
 trashing, deleting, writing the catalog, is the store machine's, on its local disk.
 
-A journal line: `operation<TAB>path<TAB>size<TAB>blake3<TAB>modified`, the operation `put` or
-`delete`. A batch's journal is written after its files, and its presence is what makes the batch
-complete: a batch without one is an interrupted push, which the next run of its machine finishes.
+A journal line: `operation<TAB>path<TAB>size<TAB>blake3<TAB>modified<TAB>base`, the operation `put`
+or `delete`, `base` the hash of the store's version the machine started from (`-` for a new file).
+A batch's journal is written after its files, and ends with an `end<TAB><line count>` line: a batch
+without a complete journal is an interrupted push, which the next run of its machine finishes, and
+which the store machine never merges. (Writing under a temporary name and renaming is not possible:
+pushing machines may only create.)
 
 ## The catalog (store machine only)
 
@@ -96,6 +99,34 @@ Before step 5, as the store's sole writer:
 - empty trash entries older than `trash_days`;
 - write `catalog.tsv`.
 
+## Concurrency (decided 2026-10-18)
+
+House Drive is general: it relies on no program's cooperation, though a program that holds files
+open without sharing (as Word and Excel do) makes its job easier.
+
+- **A local file being written while pushed.** Opening a file locks it only as far as its opener
+  chose (the share mode): many programs share nothing, some share reading or writing, and many
+  editors hold no handle at all, rewriting the file in one burst on save. So `sync` does three
+  things: it opens each file sharing reading only, so the open fails while anyone holds it for
+  writing; it records size and modified time, copies while hashing, and checks both again, dropping
+  the copy if either changed; and it leaves files modified in the last minute for the next run.
+- **Two runs on one machine** (the scheduled one and one by hand): an exclusive lock file in
+  `%LOCALAPPDATA%\house-drive`; the second run quits.
+- **Several machines pushing at once:** each writes only its own `incoming/` and `journal/` folders;
+  `files/` has one writer, the store machine.
+- **A batch still arriving:** merged only once its journal is complete (the `end` line above).
+- **`catalog.tsv` read while replaced:** written under a staging name, then renamed over the old one;
+  a reader sees one whole snapshot. If the rename fails (the old one open), the next run retries.
+- **Fetching or evicting a file in use:** a fetch writes a temporary file on the local disk, then
+  renames it into place; an eviction or remote deletion of an open file fails and is retried.
+- **Conflicts: two machines editing one file between syncs.** Each `put` carries `base`, the store's
+  hash the machine started from. When the store machine merges a `put` whose `base` is not the
+  current hash in `files/`, it keeps both: the current version stays, the incoming one lands beside
+  it as `<name> (conflict <machine_id> <date>).<ext>`, and `status` reports it on every machine. The
+  same check guards a `delete`: a deletion based on an older version than the current one is refused
+  and reported, so nothing edited elsewhere vanishes. The user resolves by keeping one and deleting
+  the other, as in Google Drive.
+
 ## Other commands
 
 - `status`: on the home network or not, store reachable or not, cache use against its limit, files
@@ -133,6 +164,10 @@ it waits until the manual steps are proven.
 - **Interrupted pushes:** a batch without its journal is finished by the next run, never merged.
 - **The store machine's merge:** batches in order; a replaced file's old version in the trash; a
   hash mismatch leaves the file unverified and asks again.
+- **Concurrency:** a file changed during its copy is not pushed; a journal without its `end` line is
+  not merged; a second run quits on the lock.
+- **Conflicts:** a `put` on a stale `base` yields a conflict copy, the current version untouched; a
+  `delete` on a stale `base` is refused.
 - **The catalog snapshot** read back equals the catalog.
 - **The network gate:** a wrong network or a wrong store ID sends nothing.
 - **An end-to-end run** with two machines and a store as temporary folders on one disk (no SMB):
