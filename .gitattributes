@@ -1,0 +1,12 @@
+# Normalize text files to LF in the repository; a checkout gets the OS's native endings, CRLF on
+# Windows, since core.eol defaults to native.
+* text=auto
+
+# Everything Bash reads must stay LF, or Bash fails with "bad interpreter".
+bin/** text eol=lf
+*.sh text eol=lf
+
+# Windows batch and PowerShell scripts need CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
