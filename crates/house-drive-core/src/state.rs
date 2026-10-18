@@ -208,6 +208,30 @@ impl State {
         transaction.commit()?;
         return Ok(());
     }
+
+    /// Records a batch whose journal is complete on the store: each file pushed with its hash
+    /// (unless it changed in the meantime), each deletion no longer pending.
+    pub fn mark_pushed(
+        &mut self,
+        files: &[(RelativePath, String)],
+        deletions: &[PendingDeletion],
+    ) -> Result<(), StateError> {
+        let transaction = self.connection.transaction()?;
+        for (path, hash) in files {
+            transaction.execute(
+                "UPDATE files SET pushed_hash = ?2 WHERE path = ?1 AND hash = ?2",
+                params![path.as_str(), hash],
+            )?;
+        }
+        for deletion in deletions {
+            transaction.execute(
+                "DELETE FROM deletions WHERE path = ?1 AND base = ?2",
+                params![deletion.path.as_str(), deletion.base],
+            )?;
+        }
+        transaction.commit()?;
+        return Ok(());
+    }
 }
 
 /// The key under which a path is compared, matching `COLLATE NOCASE`.

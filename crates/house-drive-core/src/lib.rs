@@ -3,6 +3,12 @@
 
 pub mod config;
 pub mod hash;
+pub mod journal;
 pub mod paths;
+pub mod push;
 pub mod scan;
 pub mod state;
+pub mod store;
+
+#[cfg(test)]
+pub(crate) mod test_support;

@@ -3,21 +3,29 @@
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
-use house_drive_core::config;
+use std::path::Path;
+
+use house_drive_core::config::{self, Config};
+use house_drive_core::push;
 use house_drive_core::scan;
 use house_drive_core::state::State;
+use house_drive_core::store::Store;
 
 const USAGE: &str = "usage: house-drive <command>
 
 commands:
-  config    check this machine's configuration and show it
-  scan      record new, changed and deleted files in the data root (pushes nothing)";
+  config             check this machine's configuration and show it
+  scan               record new, changed and deleted files in the data root (pushes nothing)
+  push               scan, then push new, changed and deleted files to the store
+  init-store <path>  create a store in an empty folder, once, on the store machine";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["config"] => show_config(),
-        ["scan"] => run_scan(),
+        ["scan"] => run_scan().map(|_| ()),
+        ["push"] => run_push(),
+        ["init-store", path] => init_store(Path::new(path)),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -30,6 +38,11 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     };
+}
+
+fn load_config() -> Result<Config, String> {
+    let path = config::default_path().map_err(|error| error.to_string())?;
+    return config::read(&path).map_err(|error| error.to_string());
 }
 
 fn show_config() -> Result<(), String> {
@@ -45,12 +58,13 @@ fn show_config() -> Result<(), String> {
     println!("evict_to_percent {}", config.evict_to_percent);
     println!("trash_days       {}", config.trash_days);
     println!("settle_seconds   {}", config.settle_seconds);
+    println!("batch_mb         {}", config.batch_mb);
     return Ok(());
 }
 
-fn run_scan() -> Result<(), String> {
-    let path = config::default_path().map_err(|error| error.to_string())?;
-    let config = config::read(&path).map_err(|error| error.to_string())?;
+/// Scans and prints the report, returning the configuration and the state for what follows.
+fn run_scan() -> Result<(Config, State), String> {
+    let config = load_config()?;
     let local_dir = config::local_dir().map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&local_dir)
         .map_err(|error| format!("cannot create {}: {error}", local_dir.display()))?;
@@ -75,5 +89,33 @@ fn run_scan() -> Result<(), String> {
     for link in &report.links {
         println!("link       {}", link.display());
     }
+    return Ok((config, state));
+}
+
+fn run_push() -> Result<(), String> {
+    let (config, mut state) = run_scan()?;
+    let store = Store::open(&config.store_root, &config.store_id).map_err(|error| error.to_string())?;
+    let report = push::push(
+        &store,
+        &config.machine_id,
+        &config.data_root,
+        &mut state,
+        config.batch_bytes(),
+        SystemTime::now(),
+    )
+    .map_err(|error| error.to_string())?;
+    println!("batches    {}", report.batches.len());
+    println!("pushed     {} files, {} bytes", report.pushed.len(), report.bytes);
+    println!("deletions  {}", report.deletions);
+    for path in &report.skipped {
+        println!("skipped    {path}");
+    }
+    return Ok(());
+}
+
+fn init_store(root: &Path) -> Result<(), String> {
+    let id = Store::init(root).map_err(|error| error.to_string())?;
+    println!("store created at {}", root.display());
+    println!("store_id = \"{id}\"");
     return Ok(());
 }

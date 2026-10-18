@@ -1,7 +1,7 @@
 //! Content hashes (BLAKE3) and the size-and-time stamps that decide when a hash is needed.
 
-use std::fs::{Metadata, OpenOptions};
-use std::io::{self, Read};
+use std::fs::{File, Metadata, OpenOptions};
+use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,10 +46,8 @@ pub enum Hashed {
 /// until the hash is done. Programs that hold no handle between saves are caught by comparing
 /// the stamp before and after.
 pub fn hash_stable(path: &Path) -> io::Result<Hashed> {
-    let file = match OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(path) {
-        Ok(file) => file,
-        Err(error) if is_busy(&error) => return Ok(Hashed::Busy),
-        Err(error) => return Err(error),
+    let Some(file) = open_unwritten(path)? else {
+        return Ok(Hashed::Busy);
     };
     let before = Stamp::of(&file.metadata()?);
     let hash = hash_reader(&file)?;
@@ -71,6 +69,35 @@ pub fn hash_reader(mut reader: impl Read) -> io::Result<String> {
         hasher.update(&buffer[..count]);
     }
     return Ok(hasher.finalize().to_hex().to_string());
+}
+
+/// Opens a file for reading, sharing reading only; `None` while someone holds it for writing.
+pub fn open_unwritten(path: &Path) -> io::Result<Option<File>> {
+    return match OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if is_busy(&error) => Ok(None),
+        Err(error) => Err(error),
+    };
+}
+
+/// Copies `reader` into `writer`, returning the hash of what was copied.
+pub fn copy_hashing(mut reader: impl Read, mut writer: impl Write) -> io::Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        writer.write_all(&buffer[..count])?;
+    }
+    return Ok(hasher.finalize().to_hex().to_string());
+}
+
+/// A hash as written by `hash_reader`: 64 lowercase hexadecimal digits.
+pub fn is_hash(text: &str) -> bool {
+    return text.len() == 64 && text.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
 }
 
 fn is_busy(error: &io::Error) -> bool {

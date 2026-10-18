@@ -30,6 +30,8 @@ pub struct Config {
     pub trash_days: u32,
     #[serde(default = "default_settle_seconds")]
     pub settle_seconds: u64,
+    #[serde(default = "default_batch_mb")]
+    pub batch_mb: u64,
 }
 
 fn default_sync_minutes() -> u32 {
@@ -50,6 +52,10 @@ fn default_trash_days() -> u32 {
 
 fn default_settle_seconds() -> u64 {
     return 60;
+}
+
+fn default_batch_mb() -> u64 {
+    return 1024;
 }
 
 #[derive(Debug)]
@@ -133,11 +139,18 @@ impl Config {
         if self.trash_days == 0 {
             return Err("trash_days must be at least 1".to_string());
         }
+        if self.batch_mb == 0 {
+            return Err("batch_mb must be at least 1".to_string());
+        }
         return Ok(());
     }
 
     pub fn cache_limit_bytes(&self) -> u64 {
         return self.cache_limit_gb * 1_000_000_000;
+    }
+
+    pub fn batch_bytes(&self) -> u64 {
+        return self.batch_mb * 1_000_000;
     }
 }
 
@@ -179,6 +192,7 @@ home_network_id = "{id}"
         assert_eq!(config.evict_to_percent, 90);
         assert_eq!(config.trash_days, 30);
         assert_eq!(config.settle_seconds, 60);
+        assert_eq!(config.batch_mb, 1024);
     }
 
     #[test]

@@ -28,3 +28,5 @@ trash_days = 30
 # Files modified more recently than this wait for a later run, so files written in several
 # sessions settle first.
 settle_seconds = 60
+# A push is split into batches of about this size; each batch reaches the store whole or not at all.
+batch_mb = 1024

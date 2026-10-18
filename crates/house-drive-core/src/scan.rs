@@ -201,26 +201,9 @@ pub fn scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> TempDir {
-            let path =
-                std::env::temp_dir().join(format!("house-drive-test-{name}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            return TempDir(path);
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     fn later() -> SystemTime {
         return SystemTime::now() + Duration::from_secs(3600);

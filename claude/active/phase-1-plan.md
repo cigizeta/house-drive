@@ -30,6 +30,7 @@ cache_limit_gb = 256
 evict_to_percent = 90
 trash_days = 30
 settle_seconds = 60               # files modified more recently wait for a later run
+batch_mb = 1024                   # a push is split into batches of about this size
 ```
 
 Credentials are not here: the share's account and password live in Windows Credential Manager under
@@ -53,10 +54,18 @@ trashing, deleting, writing the catalog, is the store machine's, on its local di
 
 A journal line: `operation<TAB>path<TAB>size<TAB>blake3<TAB>modified<TAB>base`, the operation `put`
 or `delete`, `base` the hash of the store's version the machine started from (`-` for a new file).
-A batch's journal is written after its files, and ends with an `end<TAB><line count>` line: a batch
-without a complete journal is an interrupted push, which the next run of its machine finishes, and
-which the store machine never merges. (Writing under a temporary name and renaming is not possible:
-pushing machines may only create.)
+A batch's journal is written after its files, and ends with an `end<TAB><line count>` line; the
+store machine never merges a batch without a complete journal. (Writing under a temporary name and
+renaming is not possible: pushing machines may only create.)
+
+**Interrupted pushes (decided 2026-10-18, step 3):** a pushing machine cannot finish a cut-short
+batch, since it cannot rewrite a half-copied file. Instead, batch names are increasing numbers
+(nanoseconds since the Unix epoch, always above the machine's newest batch), and a machine pushes
+its batches one after another, so a batch with an incomplete journal older than its machine's
+newest batch can never complete: the store machine discards it. A file counts as pushed only once
+its batch's journal is complete, so its next push repeats it. A push is split into batches of
+about `batch_mb`, so an interruption costs one batch, not the whole push, and the store merges as
+batches arrive. All pending deletions go in the first batch.
 
 ## The catalog (store machine only)
 
@@ -97,6 +106,9 @@ Before step 5, as the store's sole writer:
   into `files/` (a replaced file's old version into `trash/`), hash it on the local disk, and mark it
   verified when the hash matches the journal's, or record a mismatch, which asks the machine to push
   again; move each `delete` into `trash/`; then remove the batch's folders;
+- a `put` whose hash is already the current one in `files/` is a no-op, never a conflict: a
+  machine stopped between writing a journal and recording it pushes the same files again;
+- discard a batch whose journal is incomplete once a newer batch of its machine exists;
 - empty trash entries older than `trash_days`;
 - write `catalog.tsv`.
 
