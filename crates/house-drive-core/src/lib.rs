@@ -9,6 +9,7 @@ pub mod journal;
 pub mod merge;
 pub mod paths;
 pub mod push;
+pub mod reconcile;
 pub mod scan;
 pub mod state;
 pub mod store;

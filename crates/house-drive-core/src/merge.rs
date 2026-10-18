@@ -319,7 +319,7 @@ fn move_to_trash(target: &Path, path: &RelativePath, trash_dir: &Path) -> Result
 }
 
 /// Removes the folders a deletion left empty, up to (not including) `root`.
-fn remove_empty_parents(target: &Path, root: &Path) {
+pub(crate) fn remove_empty_parents(target: &Path, root: &Path) {
     let mut folder = target.parent();
     while let Some(path) = folder {
         if path == root || fs::remove_dir(path).is_err() {

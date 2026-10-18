@@ -96,6 +96,10 @@ pub fn scan(
                 report.refused.push(format!("{}: name is not valid Unicode", entry.path().display()));
                 continue;
             };
+            // House Drive's own folder for files being fetched.
+            if prefix.is_empty() && name == crate::reconcile::FETCH_DIR {
+                continue;
+            }
             let text = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
             if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 report.links.push(entry.path());

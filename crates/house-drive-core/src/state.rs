@@ -11,7 +11,14 @@ use rusqlite::{Connection, params};
 
 use crate::paths::{PathError, RelativePath};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// Version 2 added pins.
+const PINS_SCHEMA: &str = "
+CREATE TABLE pins (
+    path TEXT PRIMARY KEY COLLATE NOCASE
+) STRICT;
+";
 
 const SCHEMA: &str = "
 CREATE TABLE files (
@@ -111,13 +118,38 @@ impl State {
 
     fn prepare(connection: Connection) -> Result<State, StateError> {
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version == 0 {
-            connection.execute_batch(SCHEMA)?;
-            connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if version != SCHEMA_VERSION {
-            return Err(StateError::SchemaVersion(version));
+        match version {
+            0 => {
+                connection.execute_batch(SCHEMA)?;
+                connection.execute_batch(PINS_SCHEMA)?;
+            }
+            1 => connection.execute_batch(PINS_SCHEMA)?,
+            SCHEMA_VERSION => {}
+            _ => return Err(StateError::SchemaVersion(version)),
         }
+        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(State { connection });
+    }
+
+    /// Pinned files and folders: a folder's pin covers everything in it, later additions too.
+    pub fn pins(&self) -> Result<Vec<RelativePath>, StateError> {
+        let mut statement = self.connection.prepare("SELECT path FROM pins ORDER BY path")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut pins = Vec::new();
+        for row in rows {
+            pins.push(RelativePath::parse(&row?)?);
+        }
+        return Ok(pins);
+    }
+
+    pub fn add_pin(&mut self, path: &RelativePath) -> Result<(), StateError> {
+        self.connection.execute("INSERT OR REPLACE INTO pins (path) VALUES (?1)", params![path.as_str()])?;
+        return Ok(());
+    }
+
+    pub fn remove_pin(&mut self, path: &RelativePath) -> Result<(), StateError> {
+        self.connection.execute("DELETE FROM pins WHERE path = ?1", params![path.as_str()])?;
+        return Ok(());
     }
 
     pub fn files(&self) -> Result<Vec<FileRecord>, StateError> {
@@ -280,6 +312,16 @@ mod tests {
             .unwrap();
         assert!(state.files().unwrap().is_empty());
         assert_eq!(state.deletions().unwrap(), vec![PendingDeletion { path: a, base: "h".to_string() }]);
+    }
+
+    #[test]
+    fn pins_ignore_case() {
+        let mut state = State::open_in_memory().unwrap();
+        state.add_pin(&RelativePath::parse("Photos").unwrap()).unwrap();
+        state.add_pin(&RelativePath::parse("photos").unwrap()).unwrap();
+        assert_eq!(state.pins().unwrap().len(), 1);
+        state.remove_pin(&RelativePath::parse("PHOTOS").unwrap()).unwrap();
+        assert!(state.pins().unwrap().is_empty());
     }
 
     #[test]

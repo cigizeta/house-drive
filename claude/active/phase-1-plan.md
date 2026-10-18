@@ -116,6 +116,20 @@ last fetch or modification. Coarse, and enough to evict what has not been touche
 6. Over `cache_limit_gb`: evict least recently used files, verified and unpinned only, down to
    `evict_to_percent`; if not enough can go, warn.
 
+**Decided while writing step 5 (2026-10-18):**
+
+- **A local deletion of a file deleted elsewhere** requires the store to have held this machine's
+  very version (its `store_hash`), the copy to be unedited, and unchanged since the scan; an edited
+  copy is kept, reported, and pushed back. A file never seen on the store is never touched.
+- **A pending local deletion is never fetched back** by a pin.
+- **Unedited local copies are refreshed** when the store's version changed elsewhere, pinned or
+  not: no local copy goes stale silently.
+- **Fetches go through `<data_root>/.house-drive-fetch/`,** renamed into place (same volume),
+  keeping the store's modified time; the scan skips that folder, and each run clears leftovers.
+- **Eviction candidates:** verified, unedited, unpinned, unchanged since the scan; least recently
+  used first. Evicted and remotely deleted files leave the state without queueing a deletion.
+- **Pins live in the state** (schema version 2; a version 1 database gains the table).
+
 ## `sync`, on the store machine as well
 
 Before step 5, as the store's sole writer:

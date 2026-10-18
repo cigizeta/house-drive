@@ -9,6 +9,7 @@ use house_drive_core::catalog::Catalog;
 use house_drive_core::config::{self, Config};
 use house_drive_core::merge;
 use house_drive_core::push;
+use house_drive_core::reconcile::{self, Limits};
 use house_drive_core::scan;
 use house_drive_core::state::State;
 use house_drive_core::store::Store;
@@ -19,6 +20,7 @@ commands:
   config             check this machine's configuration and show it
   scan               record new, changed and deleted files in the data root (pushes nothing)
   push               scan, then push new, changed and deleted files to the store
+  sync               scan, push, merge (store machine), then verify, fetch, delete and evict
   init-store <path>  create a store in an empty folder, once, on the store machine
   merge              on the store machine: merge pushed batches, empty the trash, write the catalog";
 
@@ -27,7 +29,8 @@ fn main() -> ExitCode {
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["config"] => show_config(),
         ["scan"] => run_scan().map(|_| ()),
-        ["push"] => run_push(),
+        ["push"] => run_push().map(|_| ()),
+        ["sync"] => run_sync(),
         ["init-store", path] => init_store(Path::new(path)),
         ["merge"] => run_merge(),
         _ => {
@@ -96,7 +99,8 @@ fn run_scan() -> Result<(Config, State), String> {
     return Ok((config, state));
 }
 
-fn run_push() -> Result<(), String> {
+/// Scans and pushes, returning what the rest of a sync needs.
+fn run_push() -> Result<(Config, State, Store), String> {
     let (config, mut state) = run_scan()?;
     let store = Store::open(&config.store_root, &config.store_id).map_err(|error| error.to_string())?;
     let report = push::push(
@@ -114,6 +118,57 @@ fn run_push() -> Result<(), String> {
     for path in &report.skipped {
         println!("skipped    {path}");
     }
+    return Ok((config, state, store));
+}
+
+fn run_sync() -> Result<(), String> {
+    let (config, mut state, store) = run_push()?;
+    if config.is_store {
+        merge_and_print(&config, &store)?;
+    }
+    let Some(snapshot) = reconcile::read_snapshot(&store).map_err(|error| error.to_string())? else {
+        println!("no complete catalog on the store yet");
+        return Ok(());
+    };
+    let limits = Limits { cache_bytes: config.cache_limit_bytes(), evict_to_percent: config.evict_to_percent };
+    let report = reconcile::reconcile(
+        &store,
+        &snapshot,
+        &config.machine_id,
+        &config.data_root,
+        &mut state,
+        &limits,
+        SystemTime::now(),
+    )
+    .map_err(|error| error.to_string())?;
+    println!("verified   {}", report.verified);
+    println!("fetched    {}", report.fetched.len());
+    println!("deleted    {} (deleted on other machines)", report.deleted.len());
+    println!("evicted    {}", report.evicted.len());
+    for path in &report.repush {
+        println!("repush     {path}: rejected by the store, pushed again next run");
+    }
+    for (path, reason) in &report.fetch_failed {
+        println!("not fetched {path}: {reason}");
+    }
+    for path in &report.kept_edited {
+        println!("kept       {path}: deleted elsewhere, edited here");
+    }
+    for (path, reason) in &report.skipped {
+        println!("left alone {path}: {reason}");
+    }
+    for path in &report.conflicts {
+        println!("conflict   {path}");
+    }
+    for path in &report.refused {
+        println!("refused    deletion of {path}: changed elsewhere since");
+    }
+    if let Some(total) = report.over_limit {
+        println!(
+            "WARNING    cache at {total} bytes, over its {} GB limit: nothing more can be evicted",
+            config.cache_limit_gb
+        );
+    }
     return Ok(());
 }
 
@@ -123,12 +178,16 @@ fn run_merge() -> Result<(), String> {
         return Err("merge runs on the store machine only (is_store = true)".to_string());
     }
     let store = Store::open(&config.store_root, &config.store_id).map_err(|error| error.to_string())?;
+    return merge_and_print(&config, &store);
+}
+
+fn merge_and_print(config: &Config, store: &Store) -> Result<(), String> {
     let local_dir = config::local_dir().map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&local_dir)
         .map_err(|error| format!("cannot create {}: {error}", local_dir.display()))?;
     let mut catalog =
         Catalog::open(&local_dir.join("catalog.sqlite")).map_err(|error| error.to_string())?;
-    let report = merge::run(&store, &mut catalog, SystemTime::now(), config.trash_days)
+    let report = merge::run(store, &mut catalog, SystemTime::now(), config.trash_days)
         .map_err(|error| error.to_string())?;
     println!("batches    {} merged, {} discarded", report.merged_batches, report.discarded_batches);
     println!("placed     {}", report.placed.len());
