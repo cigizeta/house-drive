@@ -106,10 +106,14 @@ pub fn read(path: &Path) -> Result<Config, ConfigError> {
     return Ok(config);
 }
 
+/// Lowercase letters, digits and hyphens: a machine ID is also a folder name on the store.
+pub fn is_valid_machine_id(id: &str) -> bool {
+    return !id.is_empty() && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+}
+
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
-        let id_ok = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
-        if self.machine_id.is_empty() || !self.machine_id.chars().all(id_ok) {
+        if !is_valid_machine_id(&self.machine_id) {
             return Err(format!(
                 "machine_id {:?}: lowercase letters, digits and hyphens only",
                 self.machine_id

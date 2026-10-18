@@ -74,6 +74,24 @@ size, hash, modified time and verified flag; every trash entry with its date. At
 written to `catalog.tsv` on the store (staging name, then rename), which the other machines read; a
 reader therefore always sees a complete snapshot, never a half-written one.
 
+**Decided while writing step 4 (2026-10-18):**
+
+- **Listed means verified:** the store machine hashes each incoming file on its own disk before
+  moving it into `files/`, so the catalog never holds an unverified file. A mismatch is not placed:
+  it is recorded as `rejected` (machine, path, hash) in the catalog and its snapshot, so its machine
+  pushes it again; a later operation of that machine on that path clears it.
+- **The trash on disk is the record:** `trash/<date>/<batch>/<path>`, the date being the day of
+  trashing; emptied by folder date (older than `trash_days`), so no table can disagree with it.
+- **Refused deletions** are listed (`refused`) until a later operation on the path, or for
+  `trash_days`. **Conflicts** are listed until their copy is gone.
+- **Repeatable merges:** each operation checks whether an earlier, interrupted run already did it
+  (a file already placed, already trashed, a conflict copy already there, found by hash), so the
+  catalog is committed per batch and a batch's folders removed only after.
+- **Conflict copies are dated by their batch,** not by the merge, so a repeated merge finds the
+  same name; ` 2`, ` 3` follow if taken.
+- **An edit to a file deleted elsewhere is kept:** a `put` whose path the store no longer has is
+  placed, whatever its `base`.
+
 ## Each machine's state
 
 `%LOCALAPPDATA%\house-drive\state.sqlite`: every local file with size, modified time, hash, pinned,

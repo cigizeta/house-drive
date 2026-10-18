@@ -5,7 +5,9 @@ use std::time::{Duration, SystemTime};
 
 use std::path::Path;
 
+use house_drive_core::catalog::Catalog;
 use house_drive_core::config::{self, Config};
+use house_drive_core::merge;
 use house_drive_core::push;
 use house_drive_core::scan;
 use house_drive_core::state::State;
@@ -17,7 +19,8 @@ commands:
   config             check this machine's configuration and show it
   scan               record new, changed and deleted files in the data root (pushes nothing)
   push               scan, then push new, changed and deleted files to the store
-  init-store <path>  create a store in an empty folder, once, on the store machine";
+  init-store <path>  create a store in an empty folder, once, on the store machine
+  merge              on the store machine: merge pushed batches, empty the trash, write the catalog";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -26,6 +29,7 @@ fn main() -> ExitCode {
         ["scan"] => run_scan().map(|_| ()),
         ["push"] => run_push(),
         ["init-store", path] => init_store(Path::new(path)),
+        ["merge"] => run_merge(),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -109,6 +113,47 @@ fn run_push() -> Result<(), String> {
     println!("deletions  {}", report.deletions);
     for path in &report.skipped {
         println!("skipped    {path}");
+    }
+    return Ok(());
+}
+
+fn run_merge() -> Result<(), String> {
+    let config = load_config()?;
+    if !config.is_store {
+        return Err("merge runs on the store machine only (is_store = true)".to_string());
+    }
+    let store = Store::open(&config.store_root, &config.store_id).map_err(|error| error.to_string())?;
+    let local_dir = config::local_dir().map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&local_dir)
+        .map_err(|error| format!("cannot create {}: {error}", local_dir.display()))?;
+    let mut catalog =
+        Catalog::open(&local_dir.join("catalog.sqlite")).map_err(|error| error.to_string())?;
+    let report = merge::run(&store, &mut catalog, SystemTime::now(), config.trash_days)
+        .map_err(|error| error.to_string())?;
+    println!("batches    {} merged, {} discarded", report.merged_batches, report.discarded_batches);
+    println!("placed     {}", report.placed.len());
+    println!("replaced   {}", report.replaced.len());
+    println!("deleted    {}", report.deleted.len());
+    for (machine, batch) in &report.waiting {
+        println!("waiting    {machine} {batch}");
+    }
+    for path in &report.conflicts {
+        println!("conflict   {path}");
+    }
+    for path in &report.refused {
+        println!("refused    deletion of {path}: changed since");
+    }
+    for (machine, path) in &report.rejected {
+        println!("rejected   {machine} {path}: hash mismatch, to be pushed again");
+    }
+    for date in &report.trash_emptied {
+        println!("emptied    trash {date}");
+    }
+    for path in &report.ignored {
+        println!("ignored    {}", path.display());
+    }
+    if !report.snapshot_written {
+        println!("catalog.tsv not replaced (held open?), next run retries");
     }
     return Ok(());
 }
