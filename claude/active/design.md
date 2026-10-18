@@ -104,6 +104,37 @@ All six accepted, point 5 as a trash.
     over SMB, which is unsafe with several writers (SQLite among others), and the machines only ever
     create files, as the permissions require.
 
+- **A GUI that imitates Google Drive for desktop, in three phases** (2026-10-18). Drive's interface is
+  a tray icon plus Explorer itself, so House Drive writes no file explorer:
+  1. **The core and the command-line tool:** the catalog, sync, verification, eviction, the trash.
+     A core library, with every front end thin over it.
+  2. **A tray icon:** sync status, "sync now", pause, warnings as Windows notifications.
+  3. **Explorer through Windows' Cloud Files API:** a sync root listing every file of the store,
+     the ones not on this machine as placeholders; Windows' own status icons; its built-in "Always
+     keep on this device" and "Free up space" as pin and evict; opening a placeholder fetches the
+     file while the store is on. An entry in Explorer's navigation pane, and a drive letter on top
+     with `subst` if wanted. No driver to install. The earlier "commands, not a virtual drive" stands:
+     Explorer is one more front end over the same core, and placeholders opened with the store off
+     simply fail, pinned files being always local.
+  Perhaps later, a small settings window opened from the tray.
+
+  From phase 3, a process stays running to answer Explorer's fetch requests: the tray application,
+  started at logon, hosts the Explorer integration and runs the 10-minute sync itself; Task
+  Scheduler remains for running without the tray.
+
+  **Libraries, checked on crates.io 2026-10-18:**
+  - all phases: `windows` (Microsoft's official bindings, 0.62.2), for Credential Manager, the
+    network ID and NTFS rights;
+  - phase 2: `tray-icon` (0.26.1, 2026-10-07) with `muda` (0.21.2, 2026-10-08), both the Tauri
+    team's, released every few weeks, tens of millions of downloads; notifications through
+    `tauri-winrt-notification` or the `windows` crate's toasts;
+  - phase 3: `cloud-filter` (0.0.6, 2025-09-29, last commit 2025-11-02) is small and slow-moving:
+    pre-1.0, 8 stars, about 27,000 downloads, and pinned to `windows` 0.58, four versions behind, so
+    a build would carry two copies of `windows`. No open issues, no sign of abandonment. To decide at
+    phase 3: prototype on it, falling back to the `windows` crate's own `CloudFilters` bindings, or
+    take over its few needed parts, if it lags;
+  - later: `egui` / `eframe` for a settings window.
+
 ## Open
 
 Nothing left in the design's first pass. Next: the implementation plan.
