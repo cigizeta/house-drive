@@ -108,7 +108,14 @@ All six accepted, point 5 as a trash.
   a tray icon plus Explorer itself, so House Drive writes no file explorer:
   1. **The core and the command-line tool:** the catalog, sync, verification, eviction, the trash.
      A core library, with every front end thin over it.
-  2. **A tray icon:** sync status, "sync now", pause, warnings as Windows notifications.
+  2. **A tray icon:** sync status, "sync now", pause, warnings as Windows notifications. **And a
+     conflicts window** (decided 2026-10-18), opened from the tray: a conflict (two machines
+     editing one file between syncs, kept as two files) raises a notification and a warning badge
+     on the icon until resolved. The window lists each conflict's two versions (machine, date,
+     size, whether the contents differ) with four actions: keep this one, keep that one (the other
+     to the trash), keep both (the copy renamed), open both (for a merge by hand). The actions are
+     the core's, so the command line has them too (`house-drive resolve`). A conflict needs someone
+     to notice and decide, which a line in `status` does poorly.
   3. **Explorer through Windows' Cloud Files API:** a sync root listing every file of the store,
      the ones not on this machine as placeholders; Windows' own status icons; its built-in "Always
      keep on this device" and "Free up space" as pin and evict; opening a placeholder fetches the
@@ -116,7 +123,7 @@ All six accepted, point 5 as a trash.
      with `subst` if wanted. No driver to install. The earlier "commands, not a virtual drive" stands:
      Explorer is one more front end over the same core, and placeholders opened with the store off
      simply fail, pinned files being always local.
-  Perhaps later, a small settings window opened from the tray.
+  The conflicts window's toolkit, `egui`, later hosts a small settings window too.
 
   From phase 3, a process stays running to answer Explorer's fetch requests: the tray application,
   started at logon, hosts the Explorer integration and runs the 10-minute sync itself; Task
@@ -133,7 +140,7 @@ All six accepted, point 5 as a trash.
     a build would carry two copies of `windows`. No open issues, no sign of abandonment. To decide at
     phase 3: prototype on it, falling back to the `windows` crate's own `CloudFilters` bindings, or
     take over its few needed parts, if it lags;
-  - later: `egui` / `eframe` for a settings window.
+  - phase 2 as well: `egui` / `eframe` for the conflicts window, later the settings window.
 
 ## Open
 

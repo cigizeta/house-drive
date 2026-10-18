@@ -136,6 +136,8 @@ open without sharing (as Word and Excel do) makes its job easier.
 - `delete <path>`: deletes locally and queues the deletion, which goes to the store's trash.
 - `restore <path>`: queues a request the store machine honours by moving the newest trashed version
   back into `files/`.
+- `resolve <path> --keep <machine_id>|--keep-both <new name>`: settles a conflict, the version not
+  kept going to the trash; the same core actions back phase 2's conflicts window.
 - `init-store`: on the store machine, once: creates the layout and `store-id.txt`, prints the ID.
 - `join`: on any machine, once, interactive: records `machine_id`, the paths, the store ID, and the
   current network's ID as `home_network_id`; stores the credentials in Credential Manager.
@@ -181,7 +183,7 @@ it waits until the manual steps are proven.
 4. The store machine's merge, verification, trash and catalog snapshot.
 5. Reading the catalog: verified marks, fetching pins, remote deletions, eviction.
 6. The network gate and the share connection with Credential Manager; `join`.
-7. `status`, `pin`, `fetch`, `evict`, `delete`, `restore`.
+7. `status`, `pin`, `fetch`, `evict`, `delete`, `restore`, `resolve`.
 8. `schedule`; the share's setup guide; a first real installation.
 
 ## Open, for the developer
