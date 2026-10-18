@@ -98,16 +98,29 @@ The share's own permissions allow changes; the folder's rights above are what re
 ## 6. The firewall: home network only (store machine, administrator)
 
 In Windows' settings, make sure the home network's profile is **Private** on every machine
-(Settings, Network & internet, the connection's properties). Then allow file sharing on the
-Private profile only:
+(Settings, Network & internet, the connection's properties). Check it with:
 
 ```bash
-netsh advfirewall firewall set rule group="File and Printer Sharing" new enable=yes profile=private
+powershell.exe -NoProfile -Command 'Get-NetConnectionProfile | Select-Object Name, NetworkCategory'
 ```
 
-The group's name is the English one; on a Windows in another language, use its translated name,
-as shown in "Windows Defender Firewall with Advanced Security". On networks set to Public (a café,
-an office), Windows then neither offers nor reaches the share, and House Drive does not try.
+Then allow, on the Private profile only, the two kinds of incoming traffic House Drive needs: SMB
+(the share) and echo requests (so `ping` answers, for checking). The rules belong to Windows' "File
+and Printer Sharing" group, named here by its internal ID, the same in every Windows language; the
+rules are picked by their port and protocol, so their translated names do not matter:
+
+```bash
+powershell.exe -NoProfile -Command '$group = Get-NetFirewallRule -Group "@FirewallAPI.dll,-28502" | Where-Object Direction -eq Inbound; $smb = $group | Get-NetFirewallPortFilter | Where-Object LocalPort -eq 445 | Get-NetFirewallRule; $echo = $group | Get-NetFirewallPortFilter | Where-Object { $_.Protocol -in "ICMPv4","ICMPv6" } | Get-NetFirewallRule; @($smb) + @($echo) | Where-Object { $_.Profile -match "Private" } | Set-NetFirewallRule -Profile Private -Enabled True'
+```
+
+Check that exactly those rules are on, on the Private profile:
+
+```bash
+powershell.exe -NoProfile -Command 'Get-NetFirewallRule -Group "@FirewallAPI.dll,-28502" | Where-Object Enabled -eq True | Select-Object DisplayName, Profile'
+```
+
+On networks set to Public (a café, an office), Windows then neither offers nor reaches the share,
+and House Drive does not try.
 
 ## 7. Join each machine
 
