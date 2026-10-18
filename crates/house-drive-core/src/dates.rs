@@ -13,6 +13,18 @@ pub fn date_of(nanos: i64) -> String {
     return format!("{year:04}-{month:02}-{day:02}");
 }
 
+/// `YYYY-MM-DD HH:MM:SS UTC` of a time in nanoseconds since the Unix epoch.
+pub fn date_time_of(nanos: i64) -> String {
+    let seconds = nanos.div_euclid(1_000_000_000).rem_euclid(86_400);
+    return format!(
+        "{} {:02}:{:02}:{:02} UTC",
+        date_of(nanos),
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    );
+}
+
 /// Days since 1970-01-01 of a `YYYY-MM-DD` date; `None` for anything else.
 pub fn parse_date(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
@@ -69,6 +81,7 @@ mod tests {
         assert_eq!(date_of(-1), "1969-12-31");
         assert_eq!(parse_date("2000-03-01"), Some(11_017));
         assert_eq!(parse_date("1970-01-01"), Some(0));
+        assert_eq!(date_time_of(DAY + 3_723_000_000_000), "1970-01-02 01:02:03 UTC");
     }
 
     #[test]

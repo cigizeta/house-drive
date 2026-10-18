@@ -15,6 +15,7 @@ pub mod paths;
 pub mod push;
 pub mod reconcile;
 pub mod scan;
+pub mod schedule;
 pub mod share;
 pub mod state;
 pub mod store;

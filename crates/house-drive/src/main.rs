@@ -35,6 +35,8 @@ commands:
   restore <path>     bring a file or folder back from the store's trash
   resolve <copy> keep-original | keep-copy | keep-both <new path>
                      settle a conflict
+  schedule           sync by itself every sync_minutes and at logon (Task Scheduler)
+  unschedule         stop syncing by itself
   join               set this machine up, once, interactively
   set-credentials    store the share's user name and password again
   networks           list the networks this machine is connected to
@@ -66,6 +68,8 @@ fn main() -> ExitCode {
             Ok(days) if days >= 0 => empty_trash(Some(days)),
             _ => Err(format!("--older-than takes a number of days, not {days}")),
         },
+        ["schedule"] => schedule(),
+        ["unschedule"] => unschedule(),
         ["join"] => join(),
         ["set-credentials"] => set_credentials(),
         ["networks"] => show_networks(),
@@ -599,6 +603,48 @@ fn status() -> Result<(), String> {
     for refused in snapshot.refused.iter().filter(|refused| refused.machine == config.machine_id) {
         println!("refused    deletion of {}: changed elsewhere since", refused.path);
     }
+    return Ok(());
+}
+
+/// Copies both programs into House Drive's own folder, so the task survives rebuilds, then
+/// registers the task from the configuration's `sync_minutes`.
+fn schedule() -> Result<(), String> {
+    let config = load_config()?;
+    let current = std::env::current_exe().map_err(|error| error.to_string())?;
+    let built_with = current.with_file_name("house-drive-sync.exe");
+    if !built_with.exists() {
+        return Err(format!("{} is missing: build both programs (cargo build --release)", built_with.display()));
+    }
+    let bin = local_dir()?.join("bin");
+    std::fs::create_dir_all(&bin).map_err(|error| format!("{}: {error}", bin.display()))?;
+    for (source, name) in [(&current, "house-drive.exe"), (&built_with, "house-drive-sync.exe")] {
+        let target = bin.join(name);
+        if *source != target {
+            std::fs::copy(source, &target).map_err(|error| {
+                return format!("cannot copy to {} (a sync running?): {error}", target.display());
+            })?;
+        }
+    }
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(name)) => format!(r"{domain}\{name}"),
+        _ => return Err("USERDOMAIN or USERNAME is not set".to_string()),
+    };
+    let xml = house_drive_core::schedule::task_xml(&user, config.sync_minutes, &bin.join("house-drive-sync.exe"));
+    house_drive_core::schedule::register(&xml, &local_dir()?.join("task.xml"))?;
+    println!(
+        "scheduled: \"{}\" runs every {} minutes and at logon",
+        house_drive_core::schedule::TASK_NAME,
+        config.sync_minutes
+    );
+    println!("programs copied to {}", bin.display());
+    println!("each run's output goes to {}", local_dir()?.join("sync.log").display());
+    println!("after changing sync_minutes, run schedule again");
+    return Ok(());
+}
+
+fn unschedule() -> Result<(), String> {
+    house_drive_core::schedule::unregister()?;
+    println!("unscheduled: syncs now run only by hand");
     return Ok(());
 }
 

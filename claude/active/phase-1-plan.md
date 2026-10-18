@@ -158,6 +158,23 @@ last fetch or modification. Coarse, and enough to evict what has not been touche
 - **`delete`** of files only on the store queues their deletions from the local snapshot.
 - **`empty-trash`** asks for confirmation, then refreshes the catalog's usage.
 
+**Decided while writing step 8 (2026-10-18):**
+
+- **No console window every few minutes:** Task Scheduler starts `house-drive-sync.exe`, built
+  without a console, which runs `house-drive sync` hidden and appends its output to
+  `%LOCALAPPDATA%\house-drive\sync.log` (rotated past about a megabyte).
+- **`schedule` copies both programs into `%LOCALAPPDATA%\house-drive\bin`,** so the task survives
+  rebuilds, and registers one task from XML: a time trigger every `sync_minutes`, a logon trigger,
+  the user's interactive token at least privilege, no overlapping runs, battery allowed, no time
+  limit (a first push may take hours).
+- **The setup guide is `docs/store-setup.md`,** public and with placeholders only: rights by SID
+  where names are localised; the push account reads everywhere, creates and writes in
+  `incoming\` and `journal\`, deletes nowhere; the honest limit (it can rewrite its own pending
+  batches, which merging verifies) stated; a check that deleting from the share fails; a trial
+  with worthless folders before anything real.
+- **The first installation is a trial** with new, empty folders, never real data: moving any
+  real data is a later, separate decision.
+
 ## `sync`, on the store machine as well
 
 Before step 5, as the store's sole writer:
