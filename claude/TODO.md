@@ -5,4 +5,5 @@ Loose, running list of outstanding action items -- not full designs (those live 
 
 ## Now
 
-- **The implementation plan,** from design.md, whose first pass is complete (2026-10-18). Then code.
+- **Phase 1's implementation plan (phase-1-plan.md), reviewed 2026-10-18:** code, step by step,
+  starting with step 1.
