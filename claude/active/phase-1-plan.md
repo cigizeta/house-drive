@@ -130,6 +130,19 @@ last fetch or modification. Coarse, and enough to evict what has not been touche
   used first. Evicted and remotely deleted files leave the state without queueing a deletion.
 - **Pins live in the state** (schema version 2; a version 1 database gains the table).
 
+**Decided while writing step 6 (2026-10-18):**
+
+- **The store machine skips the gate and the connection** (its store is a local folder), so its
+  `home_network_id` is optional.
+- **`join` trusts the store on first use:** it asks for the share's account, connects, and reads
+  the store's ID from `store-id.txt` itself; every later run checks it.
+- **An unreachable store** (error codes for a missing path, a gone network, a timeout) ends a run
+  quietly, "nothing sent"; a refused connection (wrong password, error 1219 for a conflicting
+  connection to the same machine under another account) is an error with its remedy.
+- **Passwords are asked without echo** through the console API; mintty, which gives programs a pipe,
+  is refused with a pointer to Windows Terminal.
+- **`networks`** lists connected networks (profile, ID, name), to check the gate by hand.
+
 ## `sync`, on the store machine as well
 
 Before step 5, as the store's sole writer:

@@ -1,23 +1,31 @@
 //! `house-drive.exe`: argument parsing and output only, over house-drive-core.
 
+mod console;
+
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
-use std::path::Path;
-
 use house_drive_core::catalog::{Catalog, Quota};
 use house_drive_core::config::{self, Config};
+use house_drive_core::credentials::{self, Credentials};
 use house_drive_core::disk;
+use house_drive_core::lock::{self, RunLock};
 use house_drive_core::merge::{self, StoreLimits};
+use house_drive_core::network;
 use house_drive_core::push;
 use house_drive_core::reconcile::{self, Limits};
 use house_drive_core::scan;
+use house_drive_core::share::{self, ConnectError};
 use house_drive_core::state::State;
-use house_drive_core::store::Store;
+use house_drive_core::store::{self, Store};
 
 const USAGE: &str = "usage: house-drive <command>
 
 commands:
+  join               set this machine up, once, interactively
+  set-credentials    store the share's user name and password again
+  networks           list the networks this machine is connected to
   config             check this machine's configuration and show it
   scan               record new, changed and deleted files in the data root (pushes nothing)
   push               scan, then push new, changed and deleted files to the store
@@ -28,10 +36,13 @@ commands:
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["join"] => join(),
+        ["set-credentials"] => set_credentials(),
+        ["networks"] => show_networks(),
         ["config"] => show_config(),
-        ["scan"] => run_scan().map(|_| ()),
-        ["push"] => run_push().map(|_| ()),
-        ["sync"] => run_sync(),
+        ["scan"] => run_scan_only(),
+        ["push"] => run_sync(false),
+        ["sync"] => run_sync(true),
         ["init-store", path] => init_store(Path::new(path)),
         ["merge"] => run_merge(),
         _ => {
@@ -70,13 +81,58 @@ fn show_config() -> Result<(), String> {
     return Ok(());
 }
 
-/// Scans and prints the report, returning the configuration and the state for what follows.
-fn run_scan() -> Result<(Config, State), String> {
-    let config = load_config()?;
+fn local_dir() -> Result<PathBuf, String> {
     let local_dir = config::local_dir().map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&local_dir)
         .map_err(|error| format!("cannot create {}: {error}", local_dir.display()))?;
-    let mut state = State::open(&local_dir.join("state.sqlite")).map_err(|error| error.to_string())?;
+    return Ok(local_dir);
+}
+
+/// One run at a time on this machine; `None` while another holds the lock.
+fn take_lock() -> Result<Option<RunLock>, String> {
+    let path = local_dir()?.join("sync.lock");
+    return lock::try_lock(&path).map_err(|error| format!("{}: {error}", path.display()));
+}
+
+/// The store, if this run may and can reach it: the home network gate, the share connection
+/// with the stored credentials, then the store's ID. `None` (nothing sent) away from home or
+/// with the store off, which are ordinary states.
+fn reach_store(config: &Config) -> Result<Option<Store>, String> {
+    if !config.is_store {
+        let networks = network::connected_networks()?;
+        if !network::on_home_network(&networks, &config.home_network_id) {
+            println!("not on the home network: nothing sent");
+            return Ok(None);
+        }
+        let Some(credentials) = credentials::read()? else {
+            return Err("no credentials stored for the share: run house-drive set-credentials".to_string());
+        };
+        match share::connect(&config.store_root, &credentials) {
+            Ok(()) => {}
+            Err(ConnectError::Unreachable(_)) => {
+                println!("the store is unreachable (off?): nothing sent");
+                return Ok(None);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let store = Store::open(&config.store_root, &config.store_id).map_err(|error| error.to_string())?;
+    return Ok(Some(store));
+}
+
+fn run_scan_only() -> Result<(), String> {
+    let config = load_config()?;
+    let Some(_lock) = take_lock()? else {
+        println!("another run is in progress");
+        return Ok(());
+    };
+    run_scan(&config)?;
+    return Ok(());
+}
+
+/// Scans and prints the report, returning the state for what follows.
+fn run_scan(config: &Config) -> Result<State, String> {
+    let mut state = State::open(&local_dir()?.join("state.sqlite")).map_err(|error| error.to_string())?;
     let settle = Duration::from_secs(config.settle_seconds);
     let report = scan::scan(&config.data_root, &mut state, SystemTime::now(), settle)
         .map_err(|error| error.to_string())?;
@@ -97,21 +153,18 @@ fn run_scan() -> Result<(Config, State), String> {
     for link in &report.links {
         println!("link       {}", link.display());
     }
-    return Ok((config, state));
+    return Ok(state);
 }
 
-/// Scans and pushes, returning what the rest of a sync needs.
-fn run_push() -> Result<(Config, State, Store), String> {
-    let (config, mut state) = run_scan()?;
-    let store = Store::open(&config.store_root, &config.store_id).map_err(|error| error.to_string())?;
+fn push_and_print(config: &Config, store: &Store, state: &mut State) -> Result<(), String> {
     // The store's room as of its last snapshot; none yet means no limit known.
-    let snapshot = reconcile::read_snapshot(&store).map_err(|error| error.to_string())?;
+    let snapshot = reconcile::read_snapshot(store).map_err(|error| error.to_string())?;
     let room = snapshot.and_then(|snapshot| snapshot.quota).map_or(u64::MAX, |quota| quota.room());
     let report = push::push(
-        &store,
+        store,
         &config.machine_id,
         &config.data_root,
-        &mut state,
+        state,
         config.batch_bytes(),
         room,
         SystemTime::now(),
@@ -126,11 +179,25 @@ fn run_push() -> Result<(Config, State, Store), String> {
     if !report.held.is_empty() {
         println!("held       {} files: the store is full", report.held.len());
     }
-    return Ok((config, state, store));
+    return Ok(());
 }
 
-fn run_sync() -> Result<(), String> {
-    let (config, mut state, store) = run_push()?;
+/// `push` (`full` false) or `sync`: lock, gate, connection, scan, push, and for `sync` the
+/// store machine's merge and the reading of the catalog.
+fn run_sync(full: bool) -> Result<(), String> {
+    let config = load_config()?;
+    let Some(_lock) = take_lock()? else {
+        println!("another run is in progress");
+        return Ok(());
+    };
+    let Some(store) = reach_store(&config)? else {
+        return Ok(());
+    };
+    let mut state = run_scan(&config)?;
+    push_and_print(&config, &store, &mut state)?;
+    if !full {
+        return Ok(());
+    }
     if config.is_store {
         merge_and_print(&config, &store)?;
     }
@@ -191,16 +258,17 @@ fn run_merge() -> Result<(), String> {
     if !config.is_store {
         return Err("merge runs on the store machine only (is_store = true)".to_string());
     }
+    let Some(_lock) = take_lock()? else {
+        println!("another run is in progress");
+        return Ok(());
+    };
     let store = Store::open(&config.store_root, &config.store_id).map_err(|error| error.to_string())?;
     return merge_and_print(&config, &store);
 }
 
 fn merge_and_print(config: &Config, store: &Store) -> Result<(), String> {
-    let local_dir = config::local_dir().map_err(|error| error.to_string())?;
-    std::fs::create_dir_all(&local_dir)
-        .map_err(|error| format!("cannot create {}: {error}", local_dir.display()))?;
     let mut catalog =
-        Catalog::open(&local_dir.join("catalog.sqlite")).map_err(|error| error.to_string())?;
+        Catalog::open(&local_dir()?.join("catalog.sqlite")).map_err(|error| error.to_string())?;
     let limits = StoreLimits { quota: config.store_quota_bytes(), free_margin: config.free_margin_bytes() };
     // A failed measurement counts as a full disk: new files wait rather than risk filling it.
     let free_space = || disk::free_space(store.root()).unwrap_or(0);
@@ -258,5 +326,88 @@ fn init_store(root: &Path) -> Result<(), String> {
     let id = Store::init(root).map_err(|error| error.to_string())?;
     println!("store created at {}", root.display());
     println!("store_id = \"{id}\"");
+    return Ok(());
+}
+
+fn show_networks() -> Result<(), String> {
+    for network in network::connected_networks()? {
+        let profile = if network.private { "Private" } else { "Public " };
+        println!("{profile}  {}  {}", network.id, network.name);
+    }
+    return Ok(());
+}
+
+/// Asks for the share's account, checks it by connecting, then stores it.
+fn ask_credentials(store_root: &Path) -> Result<Credentials, String> {
+    let user = console::ask("the share's user name")?;
+    let password = console::ask_hidden("its password")?;
+    let credentials = Credentials { user, password };
+    share::connect(store_root, &credentials).map_err(|error| error.to_string())?;
+    credentials::write(&credentials)?;
+    println!("credentials stored in Credential Manager under \"{}\"", credentials::TARGET);
+    return Ok(credentials);
+}
+
+fn set_credentials() -> Result<(), String> {
+    let config = load_config()?;
+    if config.is_store {
+        return Err("the store machine reaches its store locally: no credentials needed".to_string());
+    }
+    ask_credentials(&config.store_root)?;
+    return Ok(());
+}
+
+/// Sets this machine up: its ID, folders, the home network, the share's account, and the store's
+/// ID read from the store itself (recorded now, checked at every run after).
+fn join() -> Result<(), String> {
+    let path = config::default_path().map_err(|error| error.to_string())?;
+    if path.exists() {
+        return Err(format!("{} exists: this machine has already joined (edit it by hand)", path.display()));
+    }
+    let machine_id = loop {
+        let answer = console::ask("this machine's ID (lowercase letters, digits and hyphens)")?;
+        if config::is_valid_machine_id(&answer) {
+            break answer;
+        }
+    };
+    let is_store = console::ask_yes_no("is this the store machine")?;
+    let data_root = PathBuf::from(console::ask("this machine's data folder (its cache)")?);
+    let store_root = PathBuf::from(if is_store {
+        console::ask("the store's folder on this machine (as given to init-store)")?
+    } else {
+        console::ask(r"the store's share (\\server\share)")?
+    });
+
+    let mut home_network_id = String::new();
+    if !is_store {
+        let private: Vec<_> = network::connected_networks()?.into_iter().filter(|network| network.private).collect();
+        home_network_id = match private.len() {
+            0 => {
+                return Err("not connected to any Private network: connect to the home network, set its \
+                            profile to Private in Windows' settings, and join again"
+                    .to_string());
+            }
+            1 => private[0].id.clone(),
+            _ => loop {
+                for (index, network) in private.iter().enumerate() {
+                    println!("  {}. {}  {}", index + 1, network.name, network.id);
+                }
+                let answer = console::ask("which one is the home network")?;
+                if let Ok(choice) = answer.parse::<usize>()
+                    && (1..=private.len()).contains(&choice)
+                {
+                    break private[choice - 1].id.clone();
+                }
+            },
+        };
+        ask_credentials(&store_root)?;
+    }
+
+    let store_id = store::read_id(&store_root).map_err(|error| error.to_string())?;
+    let config = Config::new(machine_id, data_root, store_root, store_id, home_network_id, is_store);
+    config::write_new(&path, &config).map_err(|error| error.to_string())?;
+    println!("joined: configuration written to {}", path.display());
+    println!("store ID {} recorded; every run checks it", config.store_id);
+    println!("next: house-drive sync");
     return Ok(());
 }

@@ -8,15 +8,17 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub machine_id: String,
     pub data_root: PathBuf,
     pub store_root: PathBuf,
     pub store_id: String,
+    /// Required on every machine but the store machine, whose store is local.
+    #[serde(default)]
     pub home_network_id: String,
     #[serde(default)]
     pub is_store: bool,
@@ -32,7 +34,7 @@ pub struct Config {
     pub settle_seconds: u64,
     #[serde(default = "default_batch_mb")]
     pub batch_mb: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_quota_gb: Option<u64>,
     #[serde(default = "default_free_margin_gb")]
     pub free_margin_gb: u64,
@@ -103,6 +105,23 @@ pub fn default_path() -> Result<PathBuf, ConfigError> {
     return Ok(local_dir()?.join("config.toml"));
 }
 
+/// Writes a new configuration file; refuses to replace an existing one.
+pub fn write_new(path: &Path, config: &Config) -> Result<(), ConfigError> {
+    use std::io::Write;
+    config.validate().map_err(|message| ConfigError::Invalid { path: path.to_path_buf(), message })?;
+    let text = toml::to_string(config)
+        .map_err(|error| ConfigError::Parse { path: path.to_path_buf(), message: error.to_string() })?;
+    let io_error = |source| {
+        return ConfigError::Read { path: path.to_path_buf(), source };
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io_error)?;
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(io_error)?;
+    file.write_all(text.as_bytes()).map_err(io_error)?;
+    return Ok(());
+}
+
 pub fn read(path: &Path) -> Result<Config, ConfigError> {
     let text = std::fs::read_to_string(path)
         .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
@@ -120,6 +139,33 @@ pub fn is_valid_machine_id(id: &str) -> bool {
 }
 
 impl Config {
+    /// A configuration with every optional value at its default.
+    pub fn new(
+        machine_id: String,
+        data_root: PathBuf,
+        store_root: PathBuf,
+        store_id: String,
+        home_network_id: String,
+        is_store: bool,
+    ) -> Config {
+        return Config {
+            machine_id,
+            data_root,
+            store_root,
+            store_id,
+            home_network_id,
+            is_store,
+            sync_minutes: default_sync_minutes(),
+            cache_limit_gb: default_cache_limit_gb(),
+            evict_to_percent: default_evict_to_percent(),
+            trash_days: default_trash_days(),
+            settle_seconds: default_settle_seconds(),
+            batch_mb: default_batch_mb(),
+            store_quota_gb: None,
+            free_margin_gb: default_free_margin_gb(),
+        };
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !is_valid_machine_id(&self.machine_id) {
             return Err(format!(
@@ -136,8 +182,8 @@ impl Config {
         if self.store_id.trim().is_empty() {
             return Err("store_id is empty".to_string());
         }
-        if self.home_network_id.trim().is_empty() {
-            return Err("home_network_id is empty".to_string());
+        if !self.is_store && self.home_network_id.trim().is_empty() {
+            return Err("home_network_id is empty (required except on the store machine)".to_string());
         }
         if self.sync_minutes == 0 {
             return Err("sync_minutes must be at least 1".to_string());
@@ -220,6 +266,24 @@ home_network_id = "{id}"
         assert_eq!(config.free_margin_gb, 20);
         assert!(parse(&format!("{MINIMAL}store_quota_gb = 0\n")).is_err());
         assert_eq!(parse(&format!("{MINIMAL}store_quota_gb = 768\n")).unwrap().store_quota_gb, Some(768));
+    }
+
+    #[test]
+    fn the_store_machine_needs_no_network_id() {
+        let store_machine = MINIMAL.replace(r#"home_network_id = "{id}""#, "is_store = true");
+        assert!(parse(&store_machine).is_ok());
+        let other = MINIMAL.replace(r#"home_network_id = "{id}""#, "");
+        assert!(parse(&other).unwrap_err().contains("home_network_id"));
+    }
+
+    #[test]
+    fn a_written_configuration_reads_back() {
+        let dir = crate::test_support::TempDir::new("config-write");
+        let path = dir.0.join("config.toml");
+        let config = parse(&format!("{MINIMAL}store_quota_gb = 768\n")).unwrap();
+        write_new(&path, &config).unwrap();
+        assert_eq!(read(&path).unwrap(), config);
+        assert!(write_new(&path, &config).is_err());
     }
 
     #[test]

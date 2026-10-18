@@ -82,14 +82,7 @@ impl Store {
     /// Opens the store at `root` only if its ID is the expected one: a different store (a
     /// look-alike share, a wrong path) stops everything before anything is sent or deleted.
     pub fn open(root: &Path, expected_id: &str) -> Result<Store, StoreError> {
-        let id_path = root.join(STORE_ID_FILE);
-        let found = match fs::read_to_string(&id_path) {
-            Ok(text) => text.trim().to_string(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(StoreError::Missing(root.to_path_buf()));
-            }
-            Err(error) => return Err(StoreError::Io { path: id_path, source: error }),
-        };
+        let found = read_id(root)?;
         if found != expected_id.trim() {
             return Err(StoreError::WrongStore { expected: expected_id.to_string(), found });
         }
@@ -137,6 +130,16 @@ impl Store {
         }
         return Ok(newest);
     }
+}
+
+/// The ID of the store at `root`, as `join` records it the first time.
+pub fn read_id(root: &Path) -> Result<String, StoreError> {
+    let id_path = root.join(STORE_ID_FILE);
+    return match fs::read_to_string(&id_path) {
+        Ok(text) => Ok(text.trim().to_string()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(StoreError::Missing(root.to_path_buf())),
+        Err(error) => Err(StoreError::Io { path: id_path, source: error }),
+    };
 }
 
 /// Batch names are zero-padded numbers, nanoseconds since the Unix epoch, always above the

@@ -3,15 +3,19 @@
 
 pub mod catalog;
 pub mod config;
+pub mod credentials;
 pub mod dates;
 pub mod disk;
 pub mod hash;
 pub mod journal;
+pub mod lock;
 pub mod merge;
+pub mod network;
 pub mod paths;
 pub mod push;
 pub mod reconcile;
 pub mod scan;
+pub mod share;
 pub mod state;
 pub mod store;
 

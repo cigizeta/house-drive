@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 house-drive-core.workspace = true
+windows.workspace = true
