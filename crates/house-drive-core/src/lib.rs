@@ -2,4 +2,7 @@
 //! over this library, which never prints and never exits the process.
 
 pub mod config;
+pub mod hash;
 pub mod paths;
+pub mod scan;
+pub mod state;

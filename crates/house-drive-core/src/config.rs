@@ -28,6 +28,8 @@ pub struct Config {
     pub evict_to_percent: u32,
     #[serde(default = "default_trash_days")]
     pub trash_days: u32,
+    #[serde(default = "default_settle_seconds")]
+    pub settle_seconds: u64,
 }
 
 fn default_sync_minutes() -> u32 {
@@ -44,6 +46,10 @@ fn default_evict_to_percent() -> u32 {
 
 fn default_trash_days() -> u32 {
     return 30;
+}
+
+fn default_settle_seconds() -> u64 {
+    return 60;
 }
 
 #[derive(Debug)]
@@ -172,6 +178,7 @@ home_network_id = "{id}"
         assert_eq!(config.cache_limit_gb, 256);
         assert_eq!(config.evict_to_percent, 90);
         assert_eq!(config.trash_days, 30);
+        assert_eq!(config.settle_seconds, 60);
     }
 
     #[test]

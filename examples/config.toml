@@ -25,3 +25,6 @@ sync_minutes = 10
 cache_limit_gb = 256
 evict_to_percent = 90
 trash_days = 30
+# Files modified more recently than this wait for a later run, so files written in several
+# sessions settle first.
+settle_seconds = 60

@@ -29,6 +29,7 @@ sync_minutes = 10
 cache_limit_gb = 256
 evict_to_percent = 90
 trash_days = 30
+settle_seconds = 60               # files modified more recently wait for a later run
 ```
 
 Credentials are not here: the share's account and password live in Windows Credential Manager under
