@@ -112,6 +112,13 @@ fn show_config() -> Result<(), String> {
     println!("trash_days       {}", config.trash_days);
     println!("settle_seconds   {}", config.settle_seconds);
     println!("batch_mb         {}", config.batch_mb);
+    if config.is_store {
+        match config.store_quota_gb {
+            Some(quota) => println!("store_quota_gb   {quota}"),
+            None => println!("store_quota_gb   none"),
+        }
+        println!("free_margin_gb   {}", config.free_margin_gb);
+    }
     return Ok(());
 }
 
@@ -691,6 +698,9 @@ fn join() -> Result<(), String> {
     };
     let is_store = console::ask_yes_no("is this the store machine")?;
     let data_root = PathBuf::from(console::ask("this machine's data folder (its cache)")?);
+    // Created now if new; once joined, a missing data folder stops every sync instead, since its
+    // files would otherwise all look deleted.
+    std::fs::create_dir_all(&data_root).map_err(|error| format!("{}: {error}", data_root.display()))?;
     let store_root = PathBuf::from(if is_store {
         console::ask("the store's folder on this machine (as given to init-store)")?
     } else {
