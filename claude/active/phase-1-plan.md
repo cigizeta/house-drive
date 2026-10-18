@@ -183,6 +183,8 @@ open without sharing (as Word and Excel do) makes its job easier.
   back into `files/`.
 - `resolve <path> --keep <machine_id>|--keep-both <new name>`: settles a conflict, the version not
   kept going to the trash; the same core actions back phase 2's conflicts window.
+- `empty-trash [--older-than <days>]`: on the store machine, empties the trash early; with the
+  trash counting toward the quota, as in Google Drive, deleting frees room only once emptied.
 - `init-store`: on the store machine, once: creates the layout and `store-id.txt`, prints the ID.
 - `join`: on any machine, once, interactive: records `machine_id`, the paths, the store ID, and the
   current network's ID as `home_network_id`; stores the credentials in Credential Manager.
@@ -228,8 +230,14 @@ it waits until the manual steps are proven.
 4. The store machine's merge, verification, trash and catalog snapshot.
 5. Reading the catalog: verified marks, fetching pins, remote deletions, eviction.
 6. The network gate and the share connection with Credential Manager; `join`.
-7. `status`, `pin`, `fetch`, `evict`, `delete`, `restore`, `resolve`.
+7. `status`, `pin`, `fetch`, `evict`, `delete`, `restore`, `resolve`, `empty-trash`.
 8. `schedule`; the share's setup guide; a first real installation.
+
+**Added after step 5 (2026-10-18): the global quota,** design.md's "one global quota", as a step of
+its own before step 6: `store_quota_gb` (store machine) and a free-space margin; usage and limit in
+the snapshot (a `quota` line); merge refusing files past either, listed `over-quota` so their
+machines push again later; pushing machines holding new and changed files while the snapshot says
+full, deletions still pushed.
 
 ## Open, for the developer
 

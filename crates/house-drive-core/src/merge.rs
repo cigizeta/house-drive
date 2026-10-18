@@ -12,7 +12,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::catalog::{self, Catalog, CatalogError, CatalogFile, CatalogTransaction, Conflict, Refused, Rejected};
+use crate::catalog::{
+    self, Catalog, CatalogError, CatalogFile, CatalogTransaction, Conflict, Quota, Refused, RejectReason, Rejected,
+};
 use crate::config;
 use crate::dates;
 use crate::hash;
@@ -36,6 +38,9 @@ pub struct MergeReport {
     pub deleted: Vec<RelativePath>,
     pub refused: Vec<RelativePath>,
     pub rejected: Vec<(String, RelativePath)>,
+    /// Not placed for lack of room (quota or free-space margin): pushed again later.
+    pub over_quota: Vec<(String, RelativePath)>,
+    pub quota: Option<Quota>,
     pub trash_emptied: Vec<String>,
     /// Folders on the store House Drive does not recognise, left alone.
     pub ignored: Vec<PathBuf>,
@@ -75,22 +80,81 @@ fn io_error(path: &Path) -> impl Fn(io::Error) -> MergeError + '_ {
     return move |source| MergeError::Io { path: path.to_path_buf(), source };
 }
 
-/// The store machine's whole run, in order: batches, trash, snapshot.
+/// The store's space rules: one quota for the whole store, shared by every machine, and a margin
+/// of free disk kept whatever the quota.
+pub struct StoreLimits {
+    pub quota: Option<u64>,
+    pub free_margin: u64,
+}
+
+/// Room left during a merge. Placing a file from `incoming/` is a rename on the same disk, so it
+/// takes no new disk space, but it does count toward the quota; refusing it frees its space.
+struct Budget {
+    used: u64,
+    quota: Option<u64>,
+    disk_ok: bool,
+}
+
+impl Budget {
+    fn admit(&mut self, size: u64) -> bool {
+        if !self.disk_ok {
+            return false;
+        }
+        if let Some(quota) = self.quota
+            && self.used + size > quota
+        {
+            return false;
+        }
+        self.used += size;
+        return true;
+    }
+}
+
+/// The store machine's whole run, in order: the trash (freeing room first), batches, snapshot.
+/// `free_space` measures the store's disk, at the start and for the snapshot.
 pub fn run(
     store: &Store,
     catalog: &mut Catalog,
     now: SystemTime,
     trash_days: u32,
+    limits: &StoreLimits,
+    free_space: &dyn Fn() -> u64,
 ) -> Result<MergeReport, MergeError> {
     let mut report = MergeReport::default();
-    merge_batches(store, catalog, now, &mut report)?;
     empty_trash(store, now, trash_days, &mut report)?;
+    let used = catalog.total_size()? + folder_size(&store.trash_dir())?;
+    let mut budget = Budget { used, quota: limits.quota, disk_ok: free_space() >= limits.free_margin };
+    merge_batches(store, catalog, now, &mut budget, &mut report)?;
     let transaction = catalog.transaction()?;
     let day = 86_400_000_000_000i64;
     transaction.prune(hash::nanos(now) - trash_days as i64 * day)?;
     transaction.commit()?;
-    report.snapshot_written = write_snapshot(store, catalog)?;
+    let quota = Quota { used: budget.used, limit: limits.quota, free: free_space(), margin: limits.free_margin };
+    report.quota = Some(quota);
+    report.snapshot_written = write_snapshot(store, catalog, quota)?;
     return Ok(report);
+}
+
+fn folder_size(folder: &Path) -> Result<u64, MergeError> {
+    let mut total = 0;
+    let mut folders = vec![folder.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        let entries = match fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(MergeError::Io { path: folder, source: error }),
+        };
+        for entry in entries {
+            let entry = entry.map_err(io_error(&folder))?;
+            let metadata = entry.metadata().map_err(io_error(&folder))?;
+            if metadata.is_dir() {
+                folders.push(entry.path());
+            } else {
+                total += metadata.len();
+            }
+        }
+    }
+    return Ok(total);
 }
 
 #[derive(Default)]
@@ -103,6 +167,7 @@ fn merge_batches(
     store: &Store,
     catalog: &mut Catalog,
     now: SystemTime,
+    budget: &mut Budget,
     report: &mut MergeReport,
 ) -> Result<(), MergeError> {
     // Every batch of every machine, merged oldest first; batch names are push times.
@@ -150,7 +215,7 @@ fn merge_batches(
         };
         match entries {
             Some(entries) => {
-                merge_batch(store, catalog, &machine, number, &entries, now, report)?;
+                merge_batch(store, catalog, &machine, number, &entries, now, budget, report)?;
                 report.merged_batches += 1;
             }
             // A machine pushes its batches one after another: an incomplete batch older than
@@ -178,6 +243,7 @@ fn merge_batch(
     number: u128,
     entries: &[Entry],
     now: SystemTime,
+    budget: &mut Budget,
     report: &mut MergeReport,
 ) -> Result<(), MergeError> {
     let batch = store::batch_name(number);
@@ -198,7 +264,12 @@ fn merge_batch(
                     modified: *modified,
                     machine: machine.to_string(),
                 };
-                let rejected = Rejected { machine: machine.to_string(), path: path.clone(), hash: hash.clone() };
+                let rejected = Rejected {
+                    machine: machine.to_string(),
+                    path: path.clone(),
+                    hash: hash.clone(),
+                    reason: RejectReason::Hash,
+                };
                 transaction.clear_reports(machine, path)?;
 
                 if !source.exists() {
@@ -226,7 +297,14 @@ fn merge_batch(
                     continue;
                 }
 
-                match transaction.get(path)? {
+                let current = transaction.get(path)?;
+                let adds_bytes = !matches!(&current, Some(current) if current.hash == *hash);
+                if adds_bytes && !budget.admit(*size) {
+                    transaction.add_rejected(&Rejected { reason: RejectReason::Quota, ..rejected })?;
+                    report.over_quota.push((machine.to_string(), path.clone()));
+                    continue;
+                }
+                match current {
                     // Pushed again after a stop between journal and state: nothing to do.
                     Some(current) if current.hash == *hash => {}
                     Some(current) if base.as_deref() == Some(current.hash.as_str()) => {
@@ -409,8 +487,10 @@ fn empty_trash(
 
 /// Writes the snapshot under a staging name, then renames it over the old one, so a reader sees
 /// either whole snapshot, never half of one.
-fn write_snapshot(store: &Store, catalog: &Catalog) -> Result<bool, MergeError> {
-    let text = catalog::format_snapshot(&catalog.snapshot()?);
+fn write_snapshot(store: &Store, catalog: &Catalog, quota: Quota) -> Result<bool, MergeError> {
+    let mut snapshot = catalog.snapshot()?;
+    snapshot.quota = Some(quota);
+    let text = catalog::format_snapshot(&snapshot);
     let staging = store.root().join(CATALOG_STAGING);
     let snapshot = store.root().join(CATALOG_SNAPSHOT);
     let file = File::create(&staging).map_err(io_error(&staging))?;
@@ -497,8 +577,14 @@ mod tests {
         return number;
     }
 
+    const NO_LIMITS: StoreLimits = StoreLimits { quota: None, free_margin: 0 };
+
     fn run(setup: &mut Setup) -> MergeReport {
-        return super::run(&setup.store, &mut setup.catalog, now(), 30).unwrap();
+        return run_with(setup, &NO_LIMITS, 1 << 40);
+    }
+
+    fn run_with(setup: &mut Setup, limits: &StoreLimits, free: u64) -> MergeReport {
+        return super::run(&setup.store, &mut setup.catalog, now(), 30, limits, &|| free).unwrap();
     }
 
     fn stored(setup: &Setup, text: &str) -> Option<Vec<u8>> {
@@ -646,9 +732,56 @@ mod tests {
         let mut setup = setup("merge-unexpected");
         fs::write(setup.store.files_dir().join("a.txt"), b"stray").unwrap();
         push_batch(&mut setup, A, &[put("a.txt", b"v1", None)], &[], true);
-        let result = super::run(&setup.store, &mut setup.catalog, now(), 30);
+        let result = super::run(&setup.store, &mut setup.catalog, now(), 30, &NO_LIMITS, &|| 1 << 40);
         assert!(matches!(result, Err(MergeError::Unexpected(_))));
         assert_eq!(fs::read(setup.store.files_dir().join("a.txt")).unwrap(), b"stray");
+    }
+
+    #[test]
+    fn files_past_the_quota_are_refused_and_listed() {
+        let mut setup = setup("merge-quota");
+        let limits = StoreLimits { quota: Some(10), free_margin: 0 };
+        push_batch(&mut setup, A, &[put("a.bin", b"123456", None), put("b.bin", b"123456", None)], &[], true);
+        let report = run_with(&mut setup, &limits, 1 << 40);
+        assert_eq!(report.placed, vec![path("a.bin")]);
+        assert_eq!(report.over_quota, vec![(A.to_string(), path("b.bin"))]);
+        assert_eq!(stored(&setup, "b.bin"), None);
+        assert_eq!(fs::read_dir(setup.store.incoming_dir(A)).unwrap().count(), 0);
+        let snapshot = setup.catalog.snapshot().unwrap();
+        assert_eq!(snapshot.rejected[0].reason, RejectReason::Quota);
+        assert_eq!(report.quota.unwrap().used, 6);
+
+        // The same content again takes no room; a replacement's old version stays counted.
+        push_batch(&mut setup, A, &[put("a.bin", b"123456", None)], &[], true);
+        assert!(run_with(&mut setup, &limits, 1 << 40).over_quota.is_empty());
+        push_batch(&mut setup, A, &[put("a.bin", b"1234567", Some(b"123456"))], &[], true);
+        assert_eq!(run_with(&mut setup, &limits, 1 << 40).over_quota.len(), 1);
+    }
+
+    #[test]
+    fn the_trash_counts_toward_the_quota() {
+        let mut setup = setup("merge-quota-trash");
+        let today = dates::date_of(hash::nanos(now()));
+        fs::create_dir_all(setup.store.trash_dir().join(&today)).unwrap();
+        fs::write(setup.store.trash_dir().join(&today).join("old"), b"12345678").unwrap();
+        push_batch(&mut setup, A, &[put("a.bin", b"123", None)], &[], true);
+        let report = run_with(&mut setup, &StoreLimits { quota: Some(10), free_margin: 0 }, 1 << 40);
+        assert_eq!(report.over_quota.len(), 1);
+        assert_eq!(report.quota.unwrap().used, 8);
+    }
+
+    #[test]
+    fn under_the_free_space_margin_new_files_wait_but_deletions_pass() {
+        let mut setup = setup("merge-margin");
+        push_batch(&mut setup, A, &[put("a.txt", b"a", None)], &[], true);
+        run(&mut setup);
+        let limits = StoreLimits { quota: None, free_margin: 100 };
+        push_batch(&mut setup, A, &[put("b.txt", b"b", None)], &[Entry::Delete { path: path("a.txt"), base: h(b"a") }], true);
+        let report = run_with(&mut setup, &limits, 50);
+        assert_eq!(report.deleted, vec![path("a.txt")]);
+        assert_eq!(report.over_quota, vec![(A.to_string(), path("b.txt"))]);
+        let quota = report.quota.unwrap();
+        assert_eq!((quota.free, quota.margin, quota.room()), (50, 100, 0));
     }
 
     #[test]

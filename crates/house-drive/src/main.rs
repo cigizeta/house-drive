@@ -5,9 +5,10 @@ use std::time::{Duration, SystemTime};
 
 use std::path::Path;
 
-use house_drive_core::catalog::Catalog;
+use house_drive_core::catalog::{Catalog, Quota};
 use house_drive_core::config::{self, Config};
-use house_drive_core::merge;
+use house_drive_core::disk;
+use house_drive_core::merge::{self, StoreLimits};
 use house_drive_core::push;
 use house_drive_core::reconcile::{self, Limits};
 use house_drive_core::scan;
@@ -103,12 +104,16 @@ fn run_scan() -> Result<(Config, State), String> {
 fn run_push() -> Result<(Config, State, Store), String> {
     let (config, mut state) = run_scan()?;
     let store = Store::open(&config.store_root, &config.store_id).map_err(|error| error.to_string())?;
+    // The store's room as of its last snapshot; none yet means no limit known.
+    let snapshot = reconcile::read_snapshot(&store).map_err(|error| error.to_string())?;
+    let room = snapshot.and_then(|snapshot| snapshot.quota).map_or(u64::MAX, |quota| quota.room());
     let report = push::push(
         &store,
         &config.machine_id,
         &config.data_root,
         &mut state,
         config.batch_bytes(),
+        room,
         SystemTime::now(),
     )
     .map_err(|error| error.to_string())?;
@@ -117,6 +122,9 @@ fn run_push() -> Result<(Config, State, Store), String> {
     println!("deletions  {}", report.deletions);
     for path in &report.skipped {
         println!("skipped    {path}");
+    }
+    if !report.held.is_empty() {
+        println!("held       {} files: the store is full", report.held.len());
     }
     return Ok((config, state, store));
 }
@@ -147,6 +155,12 @@ fn run_sync() -> Result<(), String> {
     println!("evicted    {}", report.evicted.len());
     for path in &report.repush {
         println!("repush     {path}: rejected by the store, pushed again next run");
+    }
+    for path in &report.over_quota {
+        println!("waiting    {path}: the store was full, pushed again once there is room");
+    }
+    if let Some(quota) = report.quota {
+        print_quota(&quota);
     }
     for (path, reason) in &report.fetch_failed {
         println!("not fetched {path}: {reason}");
@@ -187,8 +201,17 @@ fn merge_and_print(config: &Config, store: &Store) -> Result<(), String> {
         .map_err(|error| format!("cannot create {}: {error}", local_dir.display()))?;
     let mut catalog =
         Catalog::open(&local_dir.join("catalog.sqlite")).map_err(|error| error.to_string())?;
-    let report = merge::run(store, &mut catalog, SystemTime::now(), config.trash_days)
+    let limits = StoreLimits { quota: config.store_quota_bytes(), free_margin: config.free_margin_bytes() };
+    // A failed measurement counts as a full disk: new files wait rather than risk filling it.
+    let free_space = || disk::free_space(store.root()).unwrap_or(0);
+    let report = merge::run(store, &mut catalog, SystemTime::now(), config.trash_days, &limits, &free_space)
         .map_err(|error| error.to_string())?;
+    if let Some(quota) = report.quota {
+        print_quota(&quota);
+    }
+    for (machine, path) in &report.over_quota {
+        println!("refused    {machine} {path}: no room, to be pushed again later");
+    }
     println!("batches    {} merged, {} discarded", report.merged_batches, report.discarded_batches);
     println!("placed     {}", report.placed.len());
     println!("replaced   {}", report.replaced.len());
@@ -215,6 +238,20 @@ fn merge_and_print(config: &Config, store: &Store) -> Result<(), String> {
         println!("catalog.tsv not replaced (held open?), next run retries");
     }
     return Ok(());
+}
+
+fn print_quota(quota: &Quota) {
+    let gb = |bytes: u64| {
+        return bytes as f64 / 1e9;
+    };
+    match quota.limit {
+        Some(limit) => println!("store      {:.1} of {:.1} GB used", gb(quota.used), gb(limit)),
+        None => println!("store      {:.1} GB used, no quota", gb(quota.used)),
+    }
+    println!("store disk {:.1} GB free, {:.1} GB kept free", gb(quota.free), gb(quota.margin));
+    if quota.room() == 0 {
+        println!("WARNING    the store is full: new files wait on their machines");
+    }
 }
 
 fn init_store(root: &Path) -> Result<(), String> {

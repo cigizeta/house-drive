@@ -7,10 +7,11 @@
 //! Snapshot lines, then `end<TAB><count>` as in journals:
 //!
 //! ```text
-//! file      <path>  <size>     <blake3>  <modified>
+//! quota     <used>  <limit or -> <free>  <margin>   the store's use, quota, free disk, margin
+//! file      <path>  <size>     <blake3>  <modified> <machine>
 //! conflict  <copy>  <original> <machine>
 //! refused   <path>  <machine>  <base>          a deletion refused: the file changed meanwhile
-//! rejected  <machine> <path>   <blake3>        a pushed file whose hash did not match: push again
+//! rejected  <machine> <path>   <blake3> <reason>   a pushed file not placed: push again later
 //! end       <count>
 //! ```
 
@@ -23,7 +24,10 @@ use crate::config;
 use crate::hash;
 use crate::paths::{PathError, RelativePath};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// Version 2 added the reason a push was rejected.
+const REASON_SCHEMA: &str = "ALTER TABLE rejected ADD COLUMN reason TEXT NOT NULL DEFAULT 'hash';";
 
 const SCHEMA: &str = "
 CREATE TABLE files (
@@ -77,16 +81,63 @@ pub struct Refused {
     pub base: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// The copy's hash or size did not match its journal.
+    Hash,
+    /// Placing it would have passed the quota or the free-space margin.
+    Quota,
+}
+
+impl RejectReason {
+    pub fn as_str(self) -> &'static str {
+        return match self {
+            RejectReason::Hash => "hash",
+            RejectReason::Quota => "quota",
+        };
+    }
+
+    pub fn parse(text: &str) -> Option<RejectReason> {
+        return match text {
+            "hash" => Some(RejectReason::Hash),
+            "quota" => Some(RejectReason::Quota),
+            _ => None,
+        };
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rejected {
     pub machine: String,
     pub path: RelativePath,
     pub hash: String,
+    pub reason: RejectReason,
+}
+
+/// The store's space, measured by the store machine at its last run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quota {
+    /// Bytes in `files/` and the trash.
+    pub used: u64,
+    pub limit: Option<u64>,
+    /// Bytes free on the store's disk.
+    pub free: u64,
+    pub margin: u64,
+}
+
+impl Quota {
+    /// Bytes that may still be pushed: under both the quota and the free-space margin.
+    pub fn room(&self) -> u64 {
+        let by_quota = self.limit.map_or(u64::MAX, |limit| limit.saturating_sub(self.used));
+        let by_disk = self.free.saturating_sub(self.margin);
+        return by_quota.min(by_disk);
+    }
 }
 
 /// What the other machines read: the whole catalog at one moment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
+    pub quota: Option<Quota>,
     pub files: Vec<CatalogFile>,
     pub conflicts: Vec<Conflict>,
     pub refused: Vec<Refused>,
@@ -141,13 +192,24 @@ impl Catalog {
 
     fn prepare(connection: Connection) -> Result<Catalog, CatalogError> {
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version == 0 {
-            connection.execute_batch(SCHEMA)?;
-            connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if version != SCHEMA_VERSION {
-            return Err(CatalogError::SchemaVersion(version));
+        match version {
+            0 => {
+                connection.execute_batch(SCHEMA)?;
+                connection.execute_batch(REASON_SCHEMA)?;
+            }
+            1 => connection.execute_batch(REASON_SCHEMA)?,
+            SCHEMA_VERSION => {}
+            _ => return Err(CatalogError::SchemaVersion(version)),
         }
+        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(Catalog { connection });
+    }
+
+    /// Bytes of every file listed (the trash is measured on disk).
+    pub fn total_size(&self) -> Result<u64, CatalogError> {
+        let total: i64 =
+            self.connection.query_row("SELECT COALESCE(SUM(size), 0) FROM files", [], |row| row.get(0))?;
+        return Ok(total as u64);
     }
 
     pub fn transaction(&mut self) -> Result<CatalogTransaction<'_>, CatalogError> {
@@ -208,14 +270,21 @@ impl Catalog {
             snapshot.refused.push(Refused { path: RelativePath::parse(&path)?, machine, base });
         }
 
-        let mut statement =
-            connection.prepare("SELECT machine, path, hash FROM rejected ORDER BY machine, path")?;
+        let mut statement = connection
+            .prepare("SELECT machine, path, hash, reason FROM rejected ORDER BY machine, path")?;
         let rows = statement.query_map([], |row| {
-            return Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?));
+            return Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ));
         })?;
         for row in rows {
-            let (machine, path, hash) = row?;
-            snapshot.rejected.push(Rejected { machine, path: RelativePath::parse(&path)?, hash });
+            let (machine, path, hash, reason) = row?;
+            // An unknown reason can only come from a newer version: treat it as a mismatch.
+            let reason = RejectReason::parse(&reason).unwrap_or(RejectReason::Hash);
+            snapshot.rejected.push(Rejected { machine, path: RelativePath::parse(&path)?, hash, reason });
         }
         return Ok(snapshot);
     }
@@ -285,8 +354,8 @@ impl CatalogTransaction<'_> {
 
     pub fn add_rejected(&self, rejected: &Rejected) -> Result<(), CatalogError> {
         self.transaction.execute(
-            "INSERT OR REPLACE INTO rejected (machine, path, hash) VALUES (?1, ?2, ?3)",
-            params![rejected.machine, rejected.path.as_str(), rejected.hash],
+            "INSERT OR REPLACE INTO rejected (machine, path, hash, reason) VALUES (?1, ?2, ?3, ?4)",
+            params![rejected.machine, rejected.path.as_str(), rejected.hash, rejected.reason.as_str()],
         )?;
         return Ok(());
     }
@@ -323,6 +392,11 @@ impl CatalogTransaction<'_> {
 pub fn format_snapshot(snapshot: &Snapshot) -> String {
     let mut text = String::new();
     let mut count = 0;
+    if let Some(quota) = &snapshot.quota {
+        let limit = quota.limit.map_or("-".to_string(), |limit| limit.to_string());
+        let _ = writeln!(text, "quota\t{}\t{limit}\t{}\t{}", quota.used, quota.free, quota.margin);
+        count += 1;
+    }
     for file in &snapshot.files {
         let _ = writeln!(
             text,
@@ -340,7 +414,14 @@ pub fn format_snapshot(snapshot: &Snapshot) -> String {
         count += 1;
     }
     for rejected in &snapshot.rejected {
-        let _ = writeln!(text, "rejected\t{}\t{}\t{}", rejected.machine, rejected.path, rejected.hash);
+        let _ = writeln!(
+            text,
+            "rejected\t{}\t{}\t{}\t{}",
+            rejected.machine,
+            rejected.path,
+            rejected.hash,
+            rejected.reason.as_str()
+        );
         count += 1;
     }
     let _ = writeln!(text, "end\t{count}");
@@ -377,8 +458,19 @@ pub fn parse_snapshot(text: &str) -> Result<Option<Snapshot>, String> {
             }
             return Err(bad("bad hash"));
         };
+        let number = |text: &str| {
+            return text.parse::<u64>().map_err(|_| bad("bad number"));
+        };
         let fields: Vec<&str> = line.split('\t').collect();
         match fields.as_slice() {
+            &["quota", used, limit, free, margin] => {
+                snapshot.quota = Some(Quota {
+                    used: number(used)?,
+                    limit: if limit == "-" { None } else { Some(number(limit)?) },
+                    free: number(free)?,
+                    margin: number(margin)?,
+                })
+            }
             &["file", p, size, h, modified, m] => snapshot.files.push(CatalogFile {
                 path: path(p)?,
                 size: size.parse().map_err(|_| bad("bad size"))?,
@@ -396,10 +488,11 @@ pub fn parse_snapshot(text: &str) -> Result<Option<Snapshot>, String> {
                 machine: machine(m)?,
                 base: hash_field(base)?,
             }),
-            &["rejected", m, p, h] => snapshot.rejected.push(Rejected {
+            &["rejected", m, p, h, reason] => snapshot.rejected.push(Rejected {
                 machine: machine(m)?,
                 path: path(p)?,
                 hash: hash_field(h)?,
+                reason: RejectReason::parse(reason).ok_or_else(|| bad("bad reason"))?,
             }),
             _ => return Err(bad("unknown line")),
         }
@@ -430,12 +523,29 @@ mod tests {
             .unwrap();
         transaction.put_file(&CatalogFile { path: path("a/b (conflict).txt"), ..file.clone() }).unwrap();
         transaction.add_refused(&Refused { path: path("c"), machine: "machine-b".into(), base: h('c') }, 1).unwrap();
-        transaction.add_rejected(&Rejected { machine: "machine-a".into(), path: path("d"), hash: h('d') }).unwrap();
+        transaction
+            .add_rejected(&Rejected { machine: "machine-a".into(), path: path("d"), hash: h('d'), reason: RejectReason::Hash })
+            .unwrap();
+        transaction
+            .add_rejected(&Rejected { machine: "machine-b".into(), path: path("e"), hash: h('e'), reason: RejectReason::Quota })
+            .unwrap();
         transaction.commit().unwrap();
 
-        let snapshot = catalog.snapshot().unwrap();
+        let mut snapshot = catalog.snapshot().unwrap();
         assert_eq!(snapshot.files.len(), 2);
+        assert_eq!(catalog.total_size().unwrap(), 6);
+        snapshot.quota = Some(Quota { used: 6, limit: Some(100), free: 50, margin: 10 });
+        assert_eq!(parse_snapshot(&format_snapshot(&snapshot)).unwrap(), Some(snapshot.clone()));
+        snapshot.quota = Some(Quota { used: 6, limit: None, free: 50, margin: 10 });
         assert_eq!(parse_snapshot(&format_snapshot(&snapshot)).unwrap(), Some(snapshot));
+    }
+
+    #[test]
+    fn room_is_under_both_the_quota_and_the_margin() {
+        assert_eq!(Quota { used: 60, limit: Some(100), free: 1000, margin: 10 }.room(), 40);
+        assert_eq!(Quota { used: 60, limit: Some(100), free: 30, margin: 10 }.room(), 20);
+        assert_eq!(Quota { used: 160, limit: Some(100), free: 1000, margin: 10 }.room(), 0);
+        assert_eq!(Quota { used: 60, limit: None, free: 5, margin: 10 }.room(), 0);
     }
 
     #[test]

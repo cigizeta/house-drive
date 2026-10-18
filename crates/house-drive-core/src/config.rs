@@ -32,6 +32,10 @@ pub struct Config {
     pub settle_seconds: u64,
     #[serde(default = "default_batch_mb")]
     pub batch_mb: u64,
+    #[serde(default)]
+    pub store_quota_gb: Option<u64>,
+    #[serde(default = "default_free_margin_gb")]
+    pub free_margin_gb: u64,
 }
 
 fn default_sync_minutes() -> u32 {
@@ -56,6 +60,10 @@ fn default_settle_seconds() -> u64 {
 
 fn default_batch_mb() -> u64 {
     return 1024;
+}
+
+fn default_free_margin_gb() -> u64 {
+    return 20;
 }
 
 #[derive(Debug)]
@@ -146,7 +154,18 @@ impl Config {
         if self.batch_mb == 0 {
             return Err("batch_mb must be at least 1".to_string());
         }
+        if self.store_quota_gb == Some(0) {
+            return Err("store_quota_gb must be at least 1, or absent for no quota".to_string());
+        }
         return Ok(());
+    }
+
+    pub fn store_quota_bytes(&self) -> Option<u64> {
+        return self.store_quota_gb.map(|gb| gb * 1_000_000_000);
+    }
+
+    pub fn free_margin_bytes(&self) -> u64 {
+        return self.free_margin_gb * 1_000_000_000;
     }
 
     pub fn cache_limit_bytes(&self) -> u64 {
@@ -197,6 +216,10 @@ home_network_id = "{id}"
         assert_eq!(config.trash_days, 30);
         assert_eq!(config.settle_seconds, 60);
         assert_eq!(config.batch_mb, 1024);
+        assert_eq!(config.store_quota_gb, None);
+        assert_eq!(config.free_margin_gb, 20);
+        assert!(parse(&format!("{MINIMAL}store_quota_gb = 0\n")).is_err());
+        assert_eq!(parse(&format!("{MINIMAL}store_quota_gb = 768\n")).unwrap().store_quota_gb, Some(768));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 pub mod catalog;
 pub mod config;
 pub mod dates;
+pub mod disk;
 pub mod hash;
 pub mod journal;
 pub mod merge;

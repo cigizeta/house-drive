@@ -13,7 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::catalog::{self, CatalogFile, Snapshot};
+use crate::catalog::{self, CatalogFile, Quota, RejectReason, Snapshot};
 use crate::hash::{self, Stamp};
 use crate::merge::remove_empty_parents;
 use crate::paths::RelativePath;
@@ -31,6 +31,10 @@ pub struct ReconcileReport {
     pub verified: usize,
     /// Rejected by the store machine (hash mismatch): pushed again next run.
     pub repush: Vec<RelativePath>,
+    /// Refused by the store for lack of room: pushed again once there is room.
+    pub over_quota: Vec<RelativePath>,
+    /// The store's space at its last run.
+    pub quota: Option<Quota>,
     pub fetched: Vec<RelativePath>,
     pub fetch_failed: Vec<(RelativePath, String)>,
     /// Deleted here because deleted on another machine.
@@ -117,7 +121,8 @@ pub fn reconcile(
     let mut changed: BTreeSet<String> = BTreeSet::new();
     let mut forgotten: Vec<RelativePath> = Vec::new();
 
-    // Rejected pushes of this machine: push them again.
+    // Rejected pushes of this machine: push them again (those refused for room, once there is
+    // room: pushing holds what does not fit).
     for rejected in snapshot.rejected.iter().filter(|rejected| rejected.machine == machine_id) {
         let key = state::key(&rejected.path);
         if let Some(record) = records.get_mut(&key)
@@ -126,9 +131,13 @@ pub fn reconcile(
         {
             record.pushed_hash = None;
             changed.insert(key);
-            report.repush.push(rejected.path.clone());
+            match rejected.reason {
+                RejectReason::Hash => report.repush.push(rejected.path.clone()),
+                RejectReason::Quota => report.over_quota.push(rejected.path.clone()),
+            }
         }
     }
+    report.quota = snapshot.quota;
 
     // Verified marks: the store holds this very version.
     for (key, record) in records.iter_mut() {
@@ -431,9 +440,35 @@ mod tests {
         let mut record = record(&setup, "a.txt").unwrap();
         record.pushed_hash = Some(record.hash.clone());
         setup.state.apply(&[Change::Upsert(record)]).unwrap();
-        setup.snapshot.rejected.push(Rejected { machine: ME.into(), path: path("a.txt"), hash: h(b"a") });
+        setup.snapshot.rejected.push(Rejected {
+            machine: ME.into(),
+            path: path("a.txt"),
+            hash: h(b"a"),
+            reason: RejectReason::Hash,
+        });
         let report = run(&mut setup, u64::MAX);
         assert_eq!(report.repush, vec![path("a.txt")]);
+        assert_eq!(self::record(&setup, "a.txt").unwrap().pushed_hash, None);
+    }
+
+    #[test]
+    fn a_push_refused_for_room_waits_to_be_pushed_again() {
+        let mut setup = setup("rec-quota");
+        local(&mut setup, "a.txt", b"a", None, 0);
+        let mut record = record(&setup, "a.txt").unwrap();
+        record.pushed_hash = Some(record.hash.clone());
+        setup.state.apply(&[Change::Upsert(record)]).unwrap();
+        setup.snapshot.rejected.push(Rejected {
+            machine: ME.into(),
+            path: path("a.txt"),
+            hash: h(b"a"),
+            reason: RejectReason::Quota,
+        });
+        setup.snapshot.quota = Some(Quota { used: 10, limit: Some(10), free: 100, margin: 0 });
+        let report = run(&mut setup, u64::MAX);
+        assert_eq!(report.over_quota, vec![path("a.txt")]);
+        assert!(report.repush.is_empty());
+        assert_eq!(report.quota.unwrap().room(), 0);
         assert_eq!(self::record(&setup, "a.txt").unwrap().pushed_hash, None);
     }
 

@@ -30,3 +30,10 @@ trash_days = 30
 settle_seconds = 60
 # A push is split into batches of about this size; each batch reaches the store whole or not at all.
 batch_mb = 1024
+
+# Store machine only. One quota for the whole store, shared by every machine, counting its files
+# and its trash; absent means no quota. Over it, new files wait on their machines; nothing is
+# deleted to make room.
+# store_quota_gb = 768
+# Whatever the quota, merging stops accepting new files while the store's disk has less free.
+free_margin_gb = 20

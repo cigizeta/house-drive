@@ -28,6 +28,8 @@ pub struct PushReport {
     pub deletions: usize,
     /// Changed, busy or gone since the scan: left for a later run.
     pub skipped: Vec<RelativePath>,
+    /// Not pushed for lack of room on the store, as its last snapshot reported.
+    pub held: Vec<RelativePath>,
 }
 
 #[derive(Debug)]
@@ -65,14 +67,18 @@ fn io_error(path: &Path) -> impl Fn(io::Error) -> PushError + '_ {
     return move |source| PushError::Io { path: path.to_path_buf(), source };
 }
 
+/// `room`: bytes the store can still take (the quota and its free-space margin, from its last
+/// snapshot); files that do not fit are held here, while deletions always go.
 pub fn push(
     store: &Store,
     machine_id: &str,
     data_root: &Path,
     state: &mut State,
     batch_bytes: u64,
+    room: u64,
     now: SystemTime,
 ) -> Result<PushReport, PushError> {
+    let mut room = room;
     let files: Vec<FileRecord> = state
         .files()?
         .into_iter()
@@ -109,10 +115,15 @@ pub fn push(
                 break;
             }
             let record = queue.next().unwrap();
+            if record.size > room {
+                report.held.push(record.path);
+                continue;
+            }
             if !copy_into(&record, data_root, &batch_dir)? {
                 report.skipped.push(record.path);
                 continue;
             }
+            room -= record.size;
             bytes += record.size;
             entries.push(Entry::Put {
                 path: record.path.clone(),
@@ -214,7 +225,11 @@ mod tests {
     }
 
     fn push(setup: &mut Setup, batch_bytes: u64) -> PushReport {
-        return super::push(&setup.store, MACHINE, &setup.data.0, &mut setup.state, batch_bytes, later())
+        return push_with_room(setup, batch_bytes, u64::MAX);
+    }
+
+    fn push_with_room(setup: &mut Setup, batch_bytes: u64, room: u64) -> PushReport {
+        return super::push(&setup.store, MACHINE, &setup.data.0, &mut setup.state, batch_bytes, room, later())
             .unwrap();
     }
 
@@ -289,6 +304,27 @@ mod tests {
         assert!(report.batches.is_empty());
         assert_eq!(report.skipped, vec![RelativePath::parse("a.txt").unwrap()]);
         assert_eq!(setup.state.files().unwrap()[0].pushed_hash, None);
+    }
+
+    #[test]
+    fn files_that_do_not_fit_are_held_deletions_still_go() {
+        let mut setup = setup("push-room");
+        fs::write(setup.data.0.join("gone.txt"), b"g").unwrap();
+        scan(&mut setup);
+        push(&mut setup, 1 << 30);
+        fs::remove_file(setup.data.0.join("gone.txt")).unwrap();
+        fs::write(setup.data.0.join("big.bin"), b"0123456789").unwrap();
+        fs::write(setup.data.0.join("small.bin"), b"0123").unwrap();
+        scan(&mut setup);
+
+        let report = push_with_room(&mut setup, 1 << 30, 5);
+        assert_eq!(report.held, vec![RelativePath::parse("big.bin").unwrap()]);
+        assert_eq!(report.pushed, vec![RelativePath::parse("small.bin").unwrap()]);
+        assert_eq!(report.deletions, 1);
+
+        let report = push_with_room(&mut setup, 1 << 30, 0);
+        assert_eq!(report.held, vec![RelativePath::parse("big.bin").unwrap()]);
+        assert!(report.batches.is_empty());
     }
 
     #[test]

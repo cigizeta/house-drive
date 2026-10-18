@@ -94,6 +94,23 @@ All six accepted, point 5 as a trash.
   crosses the network once, and corruption is caught, not only truncation. A machine evicts only
   files marked verified, so the few minutes before the mark cost nothing.
 
+- **One global quota for the store, shared by every machine** (2026-10-18), as Google Drive's
+  storage: `store_quota_gb` in the store machine's configuration, counting `files/` plus the trash,
+  with no quota per machine. The snapshot publishes usage and limit. Over quota, as Google Drive:
+  nothing is deleted to make room; machines stop pushing new and changed files, which stay local,
+  unverified and so never evicted; deletions still go through (they free space), and the trash can
+  be emptied early on the store machine. The store machine refuses a batch's files that would pass
+  the quota, drops their incoming copies and lists them as over quota, so they are pushed again
+  once there is room. Independently, it refuses to merge while the disk's free space is under a
+  margin, whatever the quota says. `status` (later the tray) shows usage and warns.
+
+- **No virtual drives** (2026-10-18): no fixed-size virtual disk for a cache (eviction enforces the
+  limit, and a full virtual disk would fail programs instead), and the store is never mapped as a
+  drive (writing into `files/` by hand bypasses the catalog, and the next merge stops). **No drive
+  letter either:** `subst` could give one without a virtual disk, but it must be recreated at each
+  logon, is invisible to programs run as administrator, shows the whole disk's free space, and adds
+  little over a folder; Explorer integration (phase 3) is the nicer experience.
+
 - **The index, in two kinds** (2026-10-18):
   - **Each machine's own state,** on the machine, written by it alone: what it holds, what is
     pinned, when each file was last used (for eviction), what waits to be pushed.
@@ -119,8 +136,7 @@ All six accepted, point 5 as a trash.
   3. **Explorer through Windows' Cloud Files API:** a sync root listing every file of the store,
      the ones not on this machine as placeholders; Windows' own status icons; its built-in "Always
      keep on this device" and "Free up space" as pin and evict; opening a placeholder fetches the
-     file while the store is on. An entry in Explorer's navigation pane, and a drive letter on top
-     with `subst` if wanted. No driver to install. The earlier "commands, not a virtual drive" stands:
+     file while the store is on. An entry in Explorer's navigation pane (no drive letter). No driver to install. The earlier "commands, not a virtual drive" stands:
      Explorer is one more front end over the same core, and placeholders opened with the store off
      simply fail, pinned files being always local.
   The conflicts window's toolkit, `egui`, later hosts a small settings window too.
