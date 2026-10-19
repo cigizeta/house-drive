@@ -15,6 +15,12 @@ Loose, running list of outstanding action items -- not full designs (those live 
     empty data folder.
   - **On the HDD machine, from scratch:** the Private profile, then guide steps 1 to 7 (store on
     the HDD, data folder on the SSD), `store_quota_gb = 768`, `sync`, `schedule`.
+  - **Done on the HDD machine (2026-10-19):** setup and first sync, schedule; delete then restore
+    (the trash and back); automatic eviction (12 files of 100 MiB in a 1 GB cache: the 5 least
+    recently used evicted, back under 90%); the run lock. A scheduled run starved for minutes
+    behind a continuous CPU load at normal priority: the task runs below normal (Task
+    Scheduler's default, 7). The load was fixed on its own side; whether House Drive's task should
+    run at normal priority anyway stays open.
   - **Then the other machines:** `join`, `sync`, `schedule`; check that deleting from the share
     fails (guide step 8); then the trial's list.
   - **Learned so far:** `netsh` cannot change a rule group's profile (the guide now uses
@@ -23,5 +29,8 @@ Loose, running list of outstanding action items -- not full designs (those live 
   - **Small fixes noticed:** `sync` on the store machine prints the store's usage twice. Sizes
     print in decimal GB while Explorer shows binary units labelled "GB", so the same disk reads
     996 GB in House Drive and 928 GB in Explorer: to decide (proposed: match Explorer, for printed
-    sizes and the configured GB values alike).
+    sizes and the configured GB values alike). A scheduled run writes `sync.log` only when it
+    ends, so a long or stuck run is invisible (no log, `sync` says only "another run is in
+    progress"): `status` could say a run is in progress and since when, and the tray (phase 2)
+    must show it.
   - Then move phase-1-plan.md to `done/` and start phase 2 (the tray and the conflicts window).
