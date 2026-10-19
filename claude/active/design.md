@@ -9,6 +9,42 @@ by Task Scheduler every few minutes and at startup; files needed offline are pin
 evicted only once verified on the store. The store machine is not always on, and a machine may be
 away from the home network, so everything works offline and syncs when it can.
 
+## Goals (decided 2026-10-19)
+
+1. **A small Google Drive lite clone** whose central store machine is not always online.
+2. **Every machine sees the whole shared tree at all times,** the store on or off, each file with a
+   local state and a cloud state (below).
+3. **Seen in a GUI** (the tray and a House Drive window), and **navigated in Windows' File
+   Explorer** through the Cloud Files API (phase 3), if the spike below confirms it.
+
+**The state model.** Local state, from the machine's own state, always current:
+
+- **absent:** not on this machine, a placeholder in the tree;
+- **cached:** a local copy, evictable;
+- **pinned:** a local copy, always kept;
+- **modified/new:** local changes waiting to be pushed.
+
+Cloud state, from the last snapshot, as of the last sync:
+
+- **verified:** on the store, hash confirmed;
+- **unverified:** pushed, awaiting the store machine's check;
+- **not on store:** local only so far;
+- **over quota / rejected:** refused by the store, queued to retry;
+- **in trash:** deleted, restorable for 30 days;
+- **conflict:** two versions kept side by side.
+
+Rules: every cloud state carries its age ("as of <last sync>"), never presented as live; queued
+local actions (delete, restore, resolve) show as pending against the cloud state, not as already
+done; the tree is the snapshot plus the local-only files, so a file only on the store appears on
+every machine.
+
+**The Explorer spike, before phase 2:** a throwaway sync root with a few placeholders, to answer
+(a) whether registering it works from an unpackaged `.exe`, or needs a package identity (MSIX or a
+sparse package), and (b) whether custom states (unverified, over quota, conflict) show in
+Explorer's Status column. Its result decides how much of the state pair Explorer shows and how
+much stays in the House Drive window. Opening a placeholder with the store off fails, as with
+OneDrive offline; pinning remains the answer for files needed then.
+
 **Where to resume:** the design's first pass is complete (2026-10-18); next, the implementation
 plan, in a document of its own.
 

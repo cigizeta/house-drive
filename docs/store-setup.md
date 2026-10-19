@@ -119,6 +119,17 @@ Check that exactly those rules are on, on the Private profile:
 powershell.exe -NoProfile -Command 'Get-NetFirewallRule -Group "@FirewallAPI.dll,-28502" | Where-Object Enabled -eq True | Select-Object DisplayName, Profile'
 ```
 
+Expected: exactly three rules, all Private: SMB-In and the two Echo Request-In rules. If any rule of
+the group shows Public, turn it off; Windows' sharing settings page may read Off for Public networks
+while rules are on, so trust this list over the page:
+
+```bash
+powershell.exe -NoProfile -Command 'Get-NetFirewallRule -Group "@FirewallAPI.dll,-28502" | Where-Object { $_.Enabled -eq "True" -and $_.Profile -eq "Public" } | Disable-NetFirewallRule'
+```
+
+Leave "File and printer sharing" for Private networks Off in that page: turning it on enables the
+whole group (NetBIOS, the print spooler), which House Drive does not need.
+
 On networks set to Public (a café, an office), Windows then neither offers nor reaches the share,
 and House Drive does not try.
 
